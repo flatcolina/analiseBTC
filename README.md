@@ -21,3 +21,6 @@ uvicorn main:app --reload --port 8000
 
 ### Binance endpoint
 Por padrão usa `https://data-api.binance.vision` (market data). Você pode trocar definindo a env `BINANCE_SPOT_BASE`.
+
+
+- POST `/api/start` usa `entry_timeout_seconds` (padrão 600s).
