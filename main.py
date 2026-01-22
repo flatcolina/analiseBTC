@@ -1,176 +1,185 @@
+# -*- coding: utf-8 -*-
+"""
+BTC Scenarios Logger (Pullback vs Breakout)
+- Fetches public market data from Binance (spot public endpoints)
+- Builds 2 classical scenario families:
+  (1) Reversal in zone (pullback / rejection around VWAP band)
+  (2) Continuation (breakout confirmed beyond recent high/low + volume filter)
+- Runs in cycles:
+  snapshot -> define scenarios -> wait up to entry_timeout -> if triggered, "enter" market ->
+  manage trade (TP/SL/timeout) with simple trade-management rules -> log everything -> repeat.
 
+This is an analysis/logger, not financial advice.
+"""
 from __future__ import annotations
 
 import asyncio
 import os
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-BINANCE_SPOT_BASE = os.getenv("BINANCE_SPOT_BASE", "https://data-api.binance.vision")
+Direction = Literal["LONG", "SHORT"]
 
-
-ALLOWED_INTERVALS = {"1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d","3d","1w","1M"}
-
-def sanitize_interval(interval: str | None, default: str = "3m") -> str:
-    if interval is None:
-        return default
-    iv = str(interval).strip()
-    if iv == "" or iv.lower() == "undefined" or iv.lower() == "null":
-        return default
-    if iv not in ALLOWED_INTERVALS:
-        return default
-    return iv
+# -------------------------
+# Helpers
+# -------------------------
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
 def ms_to_iso(ms: int) -> str:
-    return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z")
+    # ISO with local time offset not required; keep UTC for logs
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ms / 1000.0)) + f".{ms%1000:03d}Z"
 
-def apply_slippage(price: float, side: str, slippage_bps: float) -> float:
-    """Adverse slippage in bps. BUY => worse (higher); SELL => worse (lower)."""
-    if slippage_bps <= 0:
-        return price
-    m = slippage_bps / 10000.0
-    s = side.upper()
-    if s == "BUY":
-        return price * (1.0 + m)
-    if s == "SELL":
-        return price * (1.0 - m)
-    return price
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+def apply_slippage(price: float, side: Literal["BUY", "SELL"], slippage_bps: float) -> float:
+    # bps = 1/100 of 1%. Example: 2 bps = 0.02%
+    f = slippage_bps / 10_000.0
+    if side == "BUY":
+        return price * (1.0 + f)
+    return price * (1.0 - f)
+
+# -------------------------
+# Market data (Binance)
+# -------------------------
+
+BINANCE_BASE = os.getenv("BINANCE_SPOT_BASE", "https://data-api.binance.vision")
+
+async def fetch_klines(symbol: str, interval: str, limit: int) -> list[list[Any]]:
+    url = f"{BINANCE_BASE}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": int(limit)}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        return r.json()
+
+async def fetch_price(symbol: str) -> float:
+    url = f"{BINANCE_BASE}/api/v3/ticker/price"
+    params = {"symbol": symbol}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        data = r.json()
+        return float(data["price"])
+
+# -------------------------
+# Indicators
+# -------------------------
 
 @dataclass
 class Candle:
-    open_time: int
+    open_time_ms: int
     open: float
     high: float
     low: float
     close: float
     volume: float
-    close_time: int
+    close_time_ms: int
 
-async def fetch_klines(symbol: str, interval: str, limit: int = 500) -> list[Candle]:
-    url = f"{BINANCE_SPOT_BASE}/api/v3/klines"
-    params: dict[str, Any] = {"symbol": symbol.upper(), "interval": sanitize_interval(interval), "limit": int(limit)}
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        data = r.json()
+def parse_klines(rows: list[list[Any]]) -> list[Candle]:
     out: list[Candle] = []
-    for row in data:
+    for r in rows:
+        # Binance kline schema
         out.append(
             Candle(
-                open_time=int(row[0]),
-                open=float(row[1]),
-                high=float(row[2]),
-                low=float(row[3]),
-                close=float(row[4]),
-                volume=float(row[5]),
-                close_time=int(row[6]),
+                open_time_ms=int(r[0]),
+                open=float(r[1]),
+                high=float(r[2]),
+                low=float(r[3]),
+                close=float(r[4]),
+                volume=float(r[5]),
+                close_time_ms=int(r[6]),
             )
         )
     return out
 
-async def fetch_price(symbol: str) -> float:
-    url = f"{BINANCE_SPOT_BASE}/api/v3/ticker/price"
-    params = {"symbol": symbol.upper()}
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        return float(r.json()["price"])
-
-def atr_wilder(candles: list[Candle], period: int = 14) -> list[float | None]:
-    n = len(candles)
-    out: list[float | None] = [None] * n
-    if n < period + 1:
+def ema_series(values: list[float], period: int) -> list[Optional[float]]:
+    if period <= 1:
+        return [float(v) for v in values]
+    k = 2.0 / (period + 1.0)
+    out: list[Optional[float]] = [None] * len(values)
+    if not values:
         return out
-    trs: list[float] = []
-    for i in range(1, n):
-        c = candles[i]
-        p = candles[i - 1]
-        tr = max(c.high - c.low, abs(c.high - p.close), abs(c.low - p.close))
-        trs.append(tr)
-    seed = sum(trs[:period]) / period
-    out[period] = seed
-    prev = seed
-    for j in range(period + 1, n):
-        tr = trs[j - 1]
-        prev = (prev * (period - 1) + tr) / period
-        out[j] = prev
+    ema_val = values[0]
+    out[0] = ema_val
+    for i in range(1, len(values)):
+        ema_val = values[i] * k + ema_val * (1.0 - k)
+        out[i] = ema_val
     return out
 
-def rsi(candles: list[Candle], period: int = 14) -> list[float | None]:
-    n = len(candles)
-    out: list[float | None] = [None] * n
-    if n < period + 1:
-        return out
-    gains = []
-    losses = []
-    for i in range(1, n):
-        change = candles[i].close - candles[i - 1].close
-        gains.append(max(change, 0.0))
-        losses.append(max(-change, 0.0))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+def rsi_series(candles: list[Candle], period: int = 14) -> list[Optional[float]]:
+    if len(candles) < period + 1:
+        return [None] * len(candles)
+    gains: list[float] = []
+    losses: list[float] = []
+    out: list[Optional[float]] = [None] * len(candles)
+    # first average
+    for i in range(1, period + 1):
+        ch = candles[i].close - candles[i - 1].close
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
     rs = (avg_gain / avg_loss) if avg_loss > 0 else float("inf")
     out[period] = 100.0 - (100.0 / (1.0 + rs))
-    for i in range(period + 1, n):
-        g = gains[i - 1]
-        l = losses[i - 1]
+    # Wilder smoothing
+    for i in range(period + 1, len(candles)):
+        ch = candles[i].close - candles[i - 1].close
+        g = max(ch, 0.0)
+        l = max(-ch, 0.0)
         avg_gain = (avg_gain * (period - 1) + g) / period
         avg_loss = (avg_loss * (period - 1) + l) / period
         rs = (avg_gain / avg_loss) if avg_loss > 0 else float("inf")
         out[i] = 100.0 - (100.0 / (1.0 + rs))
     return out
 
-def ema(values: list[float], period: int) -> list[float | None]:
-    out: list[float | None] = [None] * len(values)
-    if len(values) < period or period <= 1:
-        return out
-    k = 2.0 / (period + 1.0)
-    sma = sum(values[:period]) / period
-    out[period - 1] = sma
-    prev = sma
-    for i in range(period, len(values)):
-        prev = values[i] * k + prev * (1.0 - k)
-        out[i] = prev
+def atr_wilder_series(candles: list[Candle], period: int = 14) -> list[Optional[float]]:
+    if len(candles) < period + 1:
+        return [None] * len(candles)
+    trs: list[float] = []
+    out: list[Optional[float]] = [None] * len(candles)
+    for i in range(1, len(candles)):
+        h = candles[i].high
+        l = candles[i].low
+        pc = candles[i - 1].close
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    # initial ATR = SMA of first period TRs
+    atr = sum(trs[:period]) / period
+    out[period] = atr
+    for i in range(period + 1, len(candles)):
+        tr = trs[i - 1]
+        atr = (atr * (period - 1) + tr) / period
+        out[i] = atr
     return out
 
-def vwap_rolling(candles: list[Candle], window: int = 100) -> float | None:
-    if len(candles) < 5:
+def avg_volume(candles: list[Candle], period: int = 20) -> Optional[float]:
+    if len(candles) < period:
         return None
-    w = candles[-window:] if len(candles) >= window else candles
+    return sum(c.volume for c in candles[-period:]) / float(period)
+
+def vwap_rolling(candles: list[Candle], period: int = 100) -> Optional[float]:
+    if len(candles) < 2:
+        return None
+    use = candles[-period:] if len(candles) >= period else candles[:]
     pv = 0.0
-    vv = 0.0
-    for c in w:
+    v = 0.0
+    for c in use:
         typical = (c.high + c.low + c.close) / 3.0
         pv += typical * c.volume
-        vv += c.volume
-    if vv == 0:
-        return None
-    return pv / vv
+        v += c.volume
+    return (pv / v) if v > 0 else None
 
-def avg_volume(candles: list[Candle], window: int = 20) -> float | None:
-    if len(candles) < window:
-        return None
-    vs = [c.volume for c in candles[-window:]]
-    return sum(vs) / len(vs)
-
-Direction = Literal["LONG", "SHORT"]
-ScenarioType = Literal["PULLBACK", "BREAKOUT"]
-
-@dataclass
-class ScenarioDef:
-    scenario_type: ScenarioType
-    direction: Direction
-    name: str
-    if_then: str
+# -------------------------
+# Engine models
+# -------------------------
 
 @dataclass
 class AnalysisSnapshot:
@@ -178,76 +187,144 @@ class AnalysisSnapshot:
     symbol: str
     interval: str
     price: float
-    vwap: float | None
-    ema200: float | None
-    rsi14: float | None
-    atr14: float | None
-    avg_vol20: float | None
-    recent_high: float | None
-    recent_low: float | None
+    vwap: Optional[float]
+    ema200: Optional[float]
+    rsi14: Optional[float]
+    atr14: Optional[float]
+    avg_vol20: Optional[float]
+    recent_high: Optional[float]
+    recent_low: Optional[float]
+
+@dataclass
+class ScenarioCondition:
+    label: str
+    current: Optional[float]
+    target: Optional[float]
+    ok: bool
+    extra: dict[str, Any] | None = None
+
+@dataclass
+class ScenarioDef:
+    key: str
+    name: str
+    direction: Direction
+    kind: Literal["PULLBACK", "BREAKOUT"]
+    conditions: list[ScenarioCondition]
+    # keep computed reference values to show in UI
+    refs: dict[str, Any]
+
+@dataclass
+class TradeState:
+    cycle_id: int
+    scenario_key: str
+    scenario_kind: Literal["PULLBACK", "BREAKOUT"]
+    direction: Direction
+    entry_time_ms: int
+    entry_raw: float
+    entry_exec: float
+    qty_btc: float
+    tp_price: float
+    sl_price: float
+    atr_at_entry: float
+    be_armed: bool = False
+    be_moved: bool = False
+    tp_extended: bool = False
+    last_manage_ms: int = 0
+    last_price: float = 0.0
+
+@dataclass
+class ScenarioTotals:
+    trades: int = 0
+    tp: int = 0
+    sl: int = 0
+    time: int = 0
+
+    gross_pnl_usd: float = 0.0
+    fees_usd: float = 0.0
+    net_pnl_usd: float = 0.0
+
+    # net PnL split by outcome
+    net_tp_usd: float = 0.0
+    net_sl_usd: float = 0.0
+    net_time_usd: float = 0.0
 
 @dataclass
 class EngineStats:
     cycles_total: int = 0
     no_entry: int = 0
+    trades_total: int = 0
     tp: int = 0
     sl: int = 0
     time: int = 0
 
+    gross_pnl_usd: float = 0.0
+    fees_usd: float = 0.0
+    net_pnl_usd: float = 0.0
+
+    # net PnL split by outcome
+    net_tp_usd: float = 0.0
+    net_sl_usd: float = 0.0
+    net_time_usd: float = 0.0
+
+# -------------------------
+# Scenario engine
+# -------------------------
+
 class ScenarioEngine:
     def __init__(self) -> None:
-        self.running = False
+        self.running: bool = False
         self.task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
+
         self.logs: list[dict[str, Any]] = []
         self.stats = EngineStats()
+
+        # breakdown
+        self.by_kind: dict[str, ScenarioTotals] = {"PULLBACK": ScenarioTotals(), "BREAKOUT": ScenarioTotals()}
+        self.by_key: dict[str, ScenarioTotals] = {}
+
         self.last_snapshot: AnalysisSnapshot | None = None
         self.last_scenarios: list[ScenarioDef] = []
         self.last_cycle: dict[str, Any] | None = None
-        self.cycle_id = 0
+        self.active_trade: TradeState | None = None
+
+        self.cycle_id: int = 0
         self.cfg: dict[str, Any] = {}
 
+        self.retention_ms: int = int(os.getenv("LOG_RETENTION_HOURS", "12")) * 3600_000
+
+    def _prune_logs(self) -> None:
+        if not self.logs:
+            return
+        cutoff = now_ms() - self.retention_ms
+        # prune from front
+        i = 0
+        while i < len(self.logs) and int(self.logs[i].get("ts_ms", 0)) < cutoff:
+            i += 1
+        if i > 0:
+            self.logs = self.logs[i:]
+
+        # extra safety cap
+        cap = int(os.getenv("LOG_MAX_ROWS", "60000"))
+        if len(self.logs) > cap:
+            self.logs = self.logs[-cap:]
+
     def log(self, event: str, **data: Any) -> None:
-        row = {"ts_ms": now_ms(), "ts": ms_to_iso(now_ms()), "event": event, **data}
+        ts = now_ms()
+        row = {"ts_ms": ts, "ts": ms_to_iso(ts), "event": event, **data}
         self.logs.append(row)
-        if len(self.logs) > 2000:
-            self.logs = self.logs[-2000:]
-
-    async def start(self, **cfg: Any) -> None:
-        async with self.lock:
-            if self.running:
-                return
-            self.running = True
-            self.cfg = dict(cfg)
-            self.task = asyncio.create_task(self._run(**cfg))
-            self.log("ENGINE_START", cfg=cfg)
-
-    async def stop(self) -> None:
-        async with self.lock:
-            self.running = False
-            if self.task:
-                self.task.cancel()
-                self.task = None
-            self.log("ENGINE_STOP")
-
-    async def reset(self) -> None:
-        async with self.lock:
-            self.logs = []
-            self.stats = EngineStats()
-            self.last_snapshot = None
-            self.last_scenarios = []
-            self.last_cycle = None
-            self.cycle_id = 0
-            self.cfg = {}
-            self.log("RESET_DONE")
+        self._prune_logs()
 
     async def _snapshot(self, symbol: str, interval: str, limit: int) -> tuple[list[Candle], AnalysisSnapshot]:
-        candles = await fetch_klines(symbol, interval=sanitize_interval(interval), limit=limit)
+        raw = await fetch_klines(symbol, interval, limit)
+        candles = parse_klines(raw)
+        if not candles:
+            raise RuntimeError("No candles returned")
         price = candles[-1].close
         closes = [c.close for c in candles]
-        ema200s = ema(closes, 200)
-        rsis = rsi(candles, 14)
-        atrs = atr_wilder(candles, 14)
+        ema200s = ema_series(closes, 200)
+        rsi14s = rsi_series(candles, 14)
+        atr14s = atr_wilder_series(candles, 14)
         vwap = vwap_rolling(candles, 100)
         avgv = avg_volume(candles, 20)
 
@@ -258,64 +335,20 @@ class ScenarioEngine:
 
         snap = AnalysisSnapshot(
             ts_ms=now_ms(),
-            symbol=symbol.upper(),
-            interval=sanitize_interval(interval),
+            symbol=symbol,
+            interval=interval,
             price=float(price),
-            vwap=vwap,
-            ema200=ema200s[-1],
-            rsi14=rsis[-1],
-            atr14=atrs[-1],
-            avg_vol20=avgv,
-            recent_high=rh,
-            recent_low=rl,
+            vwap=float(vwap) if vwap is not None else None,
+            ema200=float(ema200s[-1]) if ema200s and ema200s[-1] is not None else None,
+            rsi14=float(rsi14s[-1]) if rsi14s and rsi14s[-1] is not None else None,
+            atr14=float(atr14s[-1]) if atr14s and atr14s[-1] is not None else None,
+            avg_vol20=float(avgv) if avgv is not None else None,
+            recent_high=float(rh) if rh is not None else None,
+            recent_low=float(rl) if rl is not None else None,
         )
         return candles, snap
 
-    def _build_scenarios(self, snap: AnalysisSnapshot, zone_mult_atr: float, breakout_buffer_atr: float, vol_mult: float, use_ema200: bool) -> list[ScenarioDef]:
-        vwap = snap.vwap
-        atr = snap.atr14
-        rsi14 = snap.rsi14
-        ema200 = snap.ema200
-        rh = snap.recent_high
-        rl = snap.recent_low
-
-        if vwap is None or atr is None or rsi14 is None or rh is None or rl is None:
-            return []
-
-        zone = max(atr * zone_mult_atr, atr * 0.25)
-        buf = atr * breakout_buffer_atr
-
-        ema_long = f" E preço > EMA200 (~{ema200:.0f})" if (use_ema200 and ema200 is not None) else ""
-        ema_short = f" E preço < EMA200 (~{ema200:.0f})" if (use_ema200 and ema200 is not None) else ""
-
-        return [
-            ScenarioDef(
-                scenario_type="PULLBACK",
-                direction="LONG",
-                name="Cenário 1 — Pullback LONG (VWAP)",
-                if_then=f"SE preço tocar VWAP±{zone:.0f} E voltar/fechar acima do VWAP ({vwap:.0f}) E RSI(14) >= 50{ema_long} ENTÃO COMPRAR (LONG).",
-            ),
-            ScenarioDef(
-                scenario_type="PULLBACK",
-                direction="SHORT",
-                name="Cenário 1 — Pullback SHORT (VWAP)",
-                if_then=f"SE preço tocar VWAP±{zone:.0f} E voltar/fechar abaixo do VWAP ({vwap:.0f}) E RSI(14) <= 50{ema_short} ENTÃO VENDER/SHORT (SHORT).",
-            ),
-            ScenarioDef(
-                scenario_type="BREAKOUT",
-                direction="LONG",
-                name="Cenário 2 — Breakout LONG (confirmado)",
-                if_then=f"SE candle fechar acima do topo recente ({rh:.0f}) + buffer({buf:.0f}) E acima do VWAP ({vwap:.0f}) E RSI(14) >= 55 E volume >= {vol_mult:.2f}x média(20){ema_long} ENTÃO COMPRAR (LONG).",
-            ),
-            ScenarioDef(
-                scenario_type="BREAKOUT",
-                direction="SHORT",
-                name="Cenário 2 — Breakout SHORT (confirmado)",
-                if_then=f"SE candle fechar abaixo do fundo recente ({rl:.0f}) - buffer({buf:.0f}) E abaixo do VWAP ({vwap:.0f}) E RSI(14) <= 45 E volume >= {vol_mult:.2f}x média(20){ema_short} ENTÃO VENDER/SHORT (SHORT).",
-            ),
-        ]
-
-    def _check_trigger(
+    def _build_scenarios(
         self,
         candles: list[Candle],
         snap: AnalysisSnapshot,
@@ -323,64 +356,8 @@ class ScenarioEngine:
         breakout_buffer_atr: float,
         vol_mult: float,
         use_ema200: bool,
-    ) -> ScenarioDef | None:
-        if len(candles) < 25:
-            return None
+    ) -> list[ScenarioDef]:
         last = candles[-1]
-        prev = candles[-2]
-        vwap = snap.vwap
-        atr = snap.atr14
-        rsi14 = snap.rsi14
-        ema200 = snap.ema200
-        avgv = snap.avg_vol20
-        rh = snap.recent_high
-        rl = snap.recent_low
-        if vwap is None or atr is None or rsi14 is None or avgv is None or rh is None or rl is None:
-            return None
-
-        zone = max(atr * zone_mult_atr, atr * 0.25)
-        buf = atr * breakout_buffer_atr
-
-        def ema_ok(direction: Direction) -> bool:
-            if not use_ema200 or ema200 is None:
-                return True
-            return (last.close > ema200) if direction == "LONG" else (last.close < ema200)
-
-        # Pullback LONG
-        touched = (prev.low <= vwap + zone) and (prev.high >= vwap - zone)
-        if touched and last.close > vwap and rsi14 >= 50 and ema_ok("LONG"):
-            return ScenarioDef("PULLBACK", "LONG", "Cenário 1 — Pullback LONG (VWAP)", "")
-
-        # Pullback SHORT
-        touched2 = (prev.high >= vwap - zone) and (prev.low <= vwap + zone)
-        if touched2 and last.close < vwap and rsi14 <= 50 and ema_ok("SHORT"):
-            return ScenarioDef("PULLBACK", "SHORT", "Cenário 1 — Pullback SHORT (VWAP)", "")
-
-        # Breakout LONG
-        if last.close > (rh + buf) and last.close > vwap and rsi14 >= 55 and last.volume >= (avgv * vol_mult) and ema_ok("LONG"):
-            return ScenarioDef("BREAKOUT", "LONG", "Cenário 2 — Breakout LONG (confirmado)", "")
-
-        # Breakout SHORT
-        if last.close < (rl - buf) and last.close < vwap and rsi14 <= 45 and last.volume >= (avgv * vol_mult) and ema_ok("SHORT"):
-            return ScenarioDef("BREAKOUT", "SHORT", "Cenário 2 — Breakout SHORT (confirmado)", "")
-
-        return None
-
-    
-    def build_conditions(
-        self,
-        candles: list[Candle],
-        snap: AnalysisSnapshot,
-        zone_mult_atr: float,
-        breakout_buffer_atr: float,
-        vol_mult: float,
-        use_ema200: bool,
-    ) -> dict[str, Any]:
-        if len(candles) < 25:
-            return {"ok": False, "reason": "not_enough_candles"}
-
-        last = candles[-1]
-        prev = candles[-2]
         vwap = snap.vwap
         atr = snap.atr14
         rsi14 = snap.rsi14
@@ -389,165 +366,503 @@ class ScenarioEngine:
         rh = snap.recent_high
         rl = snap.recent_low
 
-        if vwap is None or atr is None or rsi14 is None or avgv is None or rh is None or rl is None:
-            return {"ok": False, "reason": "missing_indicators"}
+        scenarios: list[ScenarioDef] = []
 
-        zone = max(atr * zone_mult_atr, atr * 0.25)
-        buf = atr * breakout_buffer_atr
-
-        def ema_ok(direction: Direction) -> tuple[bool, float | None]:
+        # helpers
+        def ema_ok(direction: Direction) -> tuple[bool, Optional[float]]:
             if not use_ema200 or ema200 is None:
                 return True, ema200
-            return ((last.close > ema200) if direction == "LONG" else (last.close < ema200)), ema200
+            if direction == "LONG":
+                return last.close > ema200, ema200
+            return last.close < ema200, ema200
 
-        vwap_dn = vwap - zone
-        vwap_up = vwap + zone
-        touch_zone = (prev.low <= vwap_up and prev.high >= vwap_dn) or (snap.price >= vwap_dn and snap.price <= vwap_up)
+        # --- Pullback zone around VWAP ---
+        # Touch zone within last 3 candles, then close back above/below VWAP
+        touch_zone = False
+        zone_dn = zone_up = None
+        if vwap is not None and atr is not None:
+            band = atr * zone_mult_atr
+            zone_dn = vwap - band
+            zone_up = vwap + band
+            look = candles[-3:] if len(candles) >= 3 else candles
+            for c in look:
+                if c.low <= zone_up and c.high >= zone_dn:
+                    touch_zone = True
+                    break
 
-        scenarios: list[dict[str, Any]] = []
+        ema_ok_long, ema_val_long = ema_ok("LONG")
+        scenarios.append(
+            ScenarioDef(
+                key="PULLBACK_LONG",
+                name="Cenário 1 — Pullback LONG (rejeição na zona do VWAP)",
+                direction="LONG",
+                kind="PULLBACK",
+                conditions=[
+                    ScenarioCondition(
+                        label="Preço tocou a zona VWAP± (últimos 3 candles)",
+                        current=last.close,
+                        target=vwap,
+                        ok=bool(touch_zone),
+                        extra={"vwap": vwap, "zone_dn": zone_dn, "zone_up": zone_up},
+                    ),
+                    ScenarioCondition(
+                        label="Fechou acima do VWAP",
+                        current=last.close,
+                        target=vwap,
+                        ok=bool(vwap is not None and last.close > vwap),
+                        extra={"vwap": vwap},
+                    ),
+                    ScenarioCondition(
+                        label="RSI(14) >= 50",
+                        current=rsi14,
+                        target=50.0,
+                        ok=bool(rsi14 is not None and rsi14 >= 50.0),
+                        extra={"rsi14": rsi14},
+                    ),
+                    ScenarioCondition(
+                        label="Filtro EMA200 (preço > EMA200)",
+                        current=last.close,
+                        target=ema_val_long,
+                        ok=bool(ema_ok_long),
+                        extra={"ema200": ema_val_long},
+                    ),
+                ],
+                refs={"vwap": vwap, "zone_dn": zone_dn, "zone_up": zone_up, "ema200": ema_val_long},
+            )
+        )
 
-        ema_ok_long, ema_val = ema_ok("LONG")
-        scenarios.append({
-            "key": "PULLBACK_LONG",
-            "name": "Cenário 1 — Pullback LONG (VWAP)",
-            "direction": "LONG",
-            "conditions": [
-                {"label": "Preço tocou a zona VWAP±", "current": snap.price, "target": {"vwap": vwap, "range": [vwap_dn, vwap_up]}, "ok": bool(touch_zone)},
-                {"label": "Fechou acima do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close > vwap)},
-                {"label": "RSI(14) >= 50", "current": rsi14, "target": 50, "ok": bool(rsi14 >= 50)},
-                {"label": "Filtro EMA200 (preço > EMA200)", "current": last.close, "target": ema_val, "ok": bool(ema_ok_long)},
-            ],
-        })
+        ema_ok_short, ema_val_short = ema_ok("SHORT")
+        scenarios.append(
+            ScenarioDef(
+                key="PULLBACK_SHORT",
+                name="Cenário 2 — Pullback SHORT (rejeição na zona do VWAP)",
+                direction="SHORT",
+                kind="PULLBACK",
+                conditions=[
+                    ScenarioCondition(
+                        label="Preço tocou a zona VWAP± (últimos 3 candles)",
+                        current=last.close,
+                        target=vwap,
+                        ok=bool(touch_zone),
+                        extra={"vwap": vwap, "zone_dn": zone_dn, "zone_up": zone_up},
+                    ),
+                    ScenarioCondition(
+                        label="Fechou abaixo do VWAP",
+                        current=last.close,
+                        target=vwap,
+                        ok=bool(vwap is not None and last.close < vwap),
+                        extra={"vwap": vwap},
+                    ),
+                    ScenarioCondition(
+                        label="RSI(14) <= 50",
+                        current=rsi14,
+                        target=50.0,
+                        ok=bool(rsi14 is not None and rsi14 <= 50.0),
+                        extra={"rsi14": rsi14},
+                    ),
+                    ScenarioCondition(
+                        label="Filtro EMA200 (preço < EMA200)",
+                        current=last.close,
+                        target=ema_val_short,
+                        ok=bool(ema_ok_short),
+                        extra={"ema200": ema_val_short},
+                    ),
+                ],
+                refs={"vwap": vwap, "zone_dn": zone_dn, "zone_up": zone_up, "ema200": ema_val_short},
+            )
+        )
 
-        ema_ok_short, ema_val2 = ema_ok("SHORT")
-        scenarios.append({
-            "key": "PULLBACK_SHORT",
-            "name": "Cenário 1 — Pullback SHORT (VWAP)",
-            "direction": "SHORT",
-            "conditions": [
-                {"label": "Preço tocou a zona VWAP±", "current": snap.price, "target": {"vwap": vwap, "range": [vwap_dn, vwap_up]}, "ok": bool(touch_zone)},
-                {"label": "Fechou abaixo do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close < vwap)},
-                {"label": "RSI(14) <= 50", "current": rsi14, "target": 50, "ok": bool(rsi14 <= 50)},
-                {"label": "Filtro EMA200 (preço < EMA200)", "current": last.close, "target": ema_val2, "ok": bool(ema_ok_short)},
-            ],
-        })
+        # --- Breakout: close beyond recent high/low + buffer & volume confirmation ---
+        buffer = (atr * breakout_buffer_atr) if (atr is not None) else None
+        vol_ok = bool(avgv is not None and last.volume >= avgv * vol_mult)
 
-        trig_long = rh + buf
-        ema_ok_long2, ema_val3 = ema_ok("LONG")
-        scenarios.append({
-            "key": "BREAKOUT_LONG",
-            "name": "Cenário 2 — Breakout LONG (confirmado)",
-            "direction": "LONG",
-            "conditions": [
-                {"label": "Fechou acima do gatilho (topo+buffer)", "current": last.close, "target": trig_long, "ok": bool(last.close > trig_long), "extra": {"recent_high": rh, "buffer": buf}},
-                {"label": "Fechou acima do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close > vwap)},
-                {"label": "RSI(14) >= 55", "current": rsi14, "target": 55, "ok": bool(rsi14 >= 55)},
-                {"label": "Volume >= X * média(20)", "current": last.volume, "target": avgv * vol_mult, "ok": bool(last.volume >= avgv * vol_mult), "extra": {"avg20": avgv, "mult": vol_mult}},
-                {"label": "Filtro EMA200 (preço > EMA200)", "current": last.close, "target": ema_val3, "ok": bool(ema_ok_long2)},
-            ],
-        })
+        scenarios.append(
+            ScenarioDef(
+                key="BREAKOUT_LONG",
+                name="Cenário 3 — Breakout LONG (rompimento confirmado)",
+                direction="LONG",
+                kind="BREAKOUT",
+                conditions=[
+                    ScenarioCondition(
+                        label="Fechou acima do topo recente + buffer",
+                        current=last.close,
+                        target=(rh + buffer) if (rh is not None and buffer is not None) else None,
+                        ok=bool(rh is not None and buffer is not None and last.close > (rh + buffer)),
+                        extra={"recent_high": rh, "buffer": buffer},
+                    ),
+                    ScenarioCondition(
+                        label=f"Volume >= média(20) × {vol_mult}",
+                        current=last.volume,
+                        target=(avgv * vol_mult) if avgv is not None else None,
+                        ok=vol_ok,
+                        extra={"avg_vol20": avgv},
+                    ),
+                    ScenarioCondition(
+                        label="RSI(14) >= 55 (força)",
+                        current=rsi14,
+                        target=55.0,
+                        ok=bool(rsi14 is not None and rsi14 >= 55.0),
+                        extra={"rsi14": rsi14},
+                    ),
+                    ScenarioCondition(
+                        label="Filtro EMA200 (preço > EMA200)",
+                        current=last.close,
+                        target=ema_val_long,
+                        ok=bool(ema_ok_long),
+                        extra={"ema200": ema_val_long},
+                    ),
+                ],
+                refs={"recent_high": rh, "buffer": buffer, "avg_vol20": avgv, "ema200": ema_val_long},
+            )
+        )
 
-        trig_short = rl - buf
-        ema_ok_short2, ema_val4 = ema_ok("SHORT")
-        scenarios.append({
-            "key": "BREAKOUT_SHORT",
-            "name": "Cenário 2 — Breakout SHORT (confirmado)",
-            "direction": "SHORT",
-            "conditions": [
-                {"label": "Fechou abaixo do gatilho (fundo-buffer)", "current": last.close, "target": trig_short, "ok": bool(last.close < trig_short), "extra": {"recent_low": rl, "buffer": buf}},
-                {"label": "Fechou abaixo do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close < vwap)},
-                {"label": "RSI(14) <= 45", "current": rsi14, "target": 45, "ok": bool(rsi14 <= 45)},
-                {"label": "Volume >= X * média(20)", "current": last.volume, "target": avgv * vol_mult, "ok": bool(last.volume >= avgv * vol_mult), "extra": {"avg20": avgv, "mult": vol_mult}},
-                {"label": "Filtro EMA200 (preço < EMA200)", "current": last.close, "target": ema_val4, "ok": bool(ema_ok_short2)},
-            ],
-        })
+        scenarios.append(
+            ScenarioDef(
+                key="BREAKOUT_SHORT",
+                name="Cenário 4 — Breakout SHORT (rompimento confirmado)",
+                direction="SHORT",
+                kind="BREAKOUT",
+                conditions=[
+                    ScenarioCondition(
+                        label="Fechou abaixo do fundo recente - buffer",
+                        current=last.close,
+                        target=(rl - buffer) if (rl is not None and buffer is not None) else None,
+                        ok=bool(rl is not None and buffer is not None and last.close < (rl - buffer)),
+                        extra={"recent_low": rl, "buffer": buffer},
+                    ),
+                    ScenarioCondition(
+                        label=f"Volume >= média(20) × {vol_mult}",
+                        current=last.volume,
+                        target=(avgv * vol_mult) if avgv is not None else None,
+                        ok=vol_ok,
+                        extra={"avg_vol20": avgv},
+                    ),
+                    ScenarioCondition(
+                        label="RSI(14) <= 45 (força)",
+                        current=rsi14,
+                        target=45.0,
+                        ok=bool(rsi14 is not None and rsi14 <= 45.0),
+                        extra={"rsi14": rsi14},
+                    ),
+                    ScenarioCondition(
+                        label="Filtro EMA200 (preço < EMA200)",
+                        current=last.close,
+                        target=ema_val_short,
+                        ok=bool(ema_ok_short),
+                        extra={"ema200": ema_val_short},
+                    ),
+                ],
+                refs={"recent_low": rl, "buffer": buffer, "avg_vol20": avgv, "ema200": ema_val_short},
+            )
+        )
 
-        return {
-            "ok": True,
-            "ts_ms": now_ms(),
-            "ts": ms_to_iso(now_ms()),
-            "symbol": snap.symbol,
-            "interval": snap.interval,
-            "scenarios": scenarios,
-        }
+        return scenarios
+
+    def _scenario_ok(self, sc: ScenarioDef) -> bool:
+        return all(c.ok for c in sc.conditions)
+
+    async def _manage_trade(
+        self,
+        trade: TradeState,
+        symbol: str,
+        interval: str,
+        limit: int,
+        poll_seconds: float,
+        fee_rate_per_side: float,
+        slippage_bps: float,
+        be_trigger_r: float,
+        trail_atr_mult: float,
+        tp_extend_buffer_atr: float,
+        tp_extend_add_atr: float,
+        recalc_seconds: float,
+    ) -> None:
+        """
+        Trade management rules (simple, deterministic):
+        - When price reaches +be_trigger_r * initial_risk, move SL to breakeven(+fees) and arm trailing.
+        - After BE is moved, trail SL by ATR * trail_atr_mult (updated ATR) when favorable.
+        - For BREAKOUT only: if price is close to TP and momentum is strong, extend TP by ATR * tp_extend_add_atr.
+        """
+        now = now_ms()
+        if (trade.last_manage_ms > 0) and (now - trade.last_manage_ms) < int(recalc_seconds * 1000):
+            return
+        trade.last_manage_ms = now
+
+        # refresh indicators for decisions
+        candles, snap = await self._snapshot(symbol, interval, limit)
+        self.last_snapshot = snap
+        cur_price = snap.price
+        trade.last_price = cur_price
+        atr = snap.atr14 or trade.atr_at_entry
+        vwap = snap.vwap
+        rsi14 = snap.rsi14
+
+        # initial risk based on initial SL (exec prices)
+        initial_risk = abs(trade.entry_exec - trade.sl_price)
+        if initial_risk <= 0:
+            return
+
+        # current R
+        if trade.direction == "LONG":
+            profit = cur_price - trade.entry_exec
+        else:
+            profit = trade.entry_exec - cur_price
+        r_mult = profit / initial_risk
+
+        # breakeven price that roughly covers entry+exit fees (ignoring slippage)
+        if trade.direction == "LONG":
+            be_price = trade.entry_exec * (1.0 + 2.0 * fee_rate_per_side)
+            # for safety, never move SL above current price
+            be_price = min(be_price, cur_price)
+            be_better = be_price > trade.sl_price
+        else:
+            be_price = trade.entry_exec * (1.0 - 2.0 * fee_rate_per_side)
+            be_price = max(be_price, cur_price)
+            be_better = be_price < trade.sl_price
+
+        # 1) move SL to breakeven when R threshold reached
+        if (not trade.be_moved) and (r_mult >= be_trigger_r) and be_better:
+            old = trade.sl_price
+            trade.sl_price = be_price
+            trade.be_moved = True
+            self.log(
+                "MOVE_SL_BE",
+                cycle_id=trade.cycle_id,
+                scenario_key=trade.scenario_key,
+                direction=trade.direction,
+                r_mult=r_mult,
+                old_sl=old,
+                new_sl=trade.sl_price,
+                vwap=vwap,
+                rsi14=rsi14,
+            )
+
+        # 2) trailing SL after BE moved (or after 1R even if not moved)
+        if trade.be_moved or (r_mult >= 1.0):
+            if trade.direction == "LONG":
+                new_sl = cur_price - (atr * trail_atr_mult)
+                if new_sl > trade.sl_price:
+                    old = trade.sl_price
+                    trade.sl_price = new_sl
+                    self.log(
+                        "TRAIL_SL",
+                        cycle_id=trade.cycle_id,
+                        scenario_key=trade.scenario_key,
+                        direction=trade.direction,
+                        old_sl=old,
+                        new_sl=trade.sl_price,
+                        atr=atr,
+                        vwap=vwap,
+                        rsi14=rsi14,
+                    )
+            else:
+                new_sl = cur_price + (atr * trail_atr_mult)
+                if new_sl < trade.sl_price:
+                    old = trade.sl_price
+                    trade.sl_price = new_sl
+                    self.log(
+                        "TRAIL_SL",
+                        cycle_id=trade.cycle_id,
+                        scenario_key=trade.scenario_key,
+                        direction=trade.direction,
+                        old_sl=old,
+                        new_sl=trade.sl_price,
+                        atr=atr,
+                        vwap=vwap,
+                        rsi14=rsi14,
+                    )
+
+        # 3) extend TP (BREAKOUT only) when close to TP and momentum strong
+        if trade.scenario_kind == "BREAKOUT" and (not trade.tp_extended):
+            close_to_tp = False
+            if trade.direction == "LONG":
+                close_to_tp = cur_price >= (trade.tp_price - atr * tp_extend_buffer_atr)
+                momentum_strong = bool((rsi14 is not None and rsi14 >= 60.0) and (vwap is None or cur_price >= vwap))
+                if close_to_tp and momentum_strong:
+                    old_tp = trade.tp_price
+                    trade.tp_price = trade.tp_price + atr * tp_extend_add_atr
+                    trade.tp_extended = True
+                    self.log(
+                        "EXTEND_TP",
+                        cycle_id=trade.cycle_id,
+                        scenario_key=trade.scenario_key,
+                        direction=trade.direction,
+                        old_tp=old_tp,
+                        new_tp=trade.tp_price,
+                        atr=atr,
+                        vwap=vwap,
+                        rsi14=rsi14,
+                    )
+            else:
+                close_to_tp = cur_price <= (trade.tp_price + atr * tp_extend_buffer_atr)
+                momentum_strong = bool((rsi14 is not None and rsi14 <= 40.0) and (vwap is None or cur_price <= vwap))
+                if close_to_tp and momentum_strong:
+                    old_tp = trade.tp_price
+                    trade.tp_price = trade.tp_price - atr * tp_extend_add_atr
+                    trade.tp_extended = True
+                    self.log(
+                        "EXTEND_TP",
+                        cycle_id=trade.cycle_id,
+                        scenario_key=trade.scenario_key,
+                        direction=trade.direction,
+                        old_tp=old_tp,
+                        new_tp=trade.tp_price,
+                        atr=atr,
+                        vwap=vwap,
+                        rsi14=rsi14,
+                    )
 
     async def _monitor_trade(
         self,
+        trade: TradeState,
         symbol: str,
-        direction: Direction,
-        entry_price_raw: float,
-        entry_exec: float,
-        qty_btc: float,
-        tp_atr_mult: float,
-        sl_atr_mult: float,
-        atr_value: float,
-        slippage_bps: float,
-        fee_rate_per_side: float,
-        max_hold_minutes: int,
+        interval: str,
+        limit: int,
         poll_seconds: float,
+        fee_rate_per_side: float,
+        slippage_bps: float,
+        max_hold_minutes: int,
+        be_trigger_r: float,
+        trail_atr_mult: float,
+        tp_extend_buffer_atr: float,
+        tp_extend_add_atr: float,
+        recalc_seconds: float,
     ) -> dict[str, Any]:
-        tp_dist = atr_value * tp_atr_mult
-        sl_dist = atr_value * sl_atr_mult
-        tp_price = entry_price_raw + tp_dist if direction == "LONG" else entry_price_raw - tp_dist
-        sl_price = entry_price_raw - sl_dist if direction == "LONG" else entry_price_raw + sl_dist
-
-        self.log("TRADE_SET", direction=direction, entry_price=entry_price_raw, tp_price=tp_price, sl_price=sl_price, tp_dist=tp_dist, sl_dist=sl_dist)
+        self.active_trade = trade
+        self.log(
+            "TRADE_SET",
+            cycle_id=trade.cycle_id,
+            scenario_key=trade.scenario_key,
+            scenario_kind=trade.scenario_kind,
+            direction=trade.direction,
+            entry_raw=trade.entry_raw,
+            entry_exec=trade.entry_exec,
+            qty_btc=trade.qty_btc,
+            tp_price=trade.tp_price,
+            sl_price=trade.sl_price,
+            atr_at_entry=trade.atr_at_entry,
+        )
 
         deadline = now_ms() + max_hold_minutes * 60_000
+        while self.running and now_ms() < deadline:
+            cur_price = await fetch_price(symbol)
+            trade.last_price = cur_price
 
-        while self.running:
-            p = await fetch_price(symbol)
-            t_ms = now_ms()
+            # run trade management periodically
+            try:
+                await self._manage_trade(
+                    trade=trade,
+                    symbol=symbol,
+                    interval=interval,
+                    limit=limit,
+                    poll_seconds=poll_seconds,
+                    fee_rate_per_side=fee_rate_per_side,
+                    slippage_bps=slippage_bps,
+                    be_trigger_r=be_trigger_r,
+                    trail_atr_mult=trail_atr_mult,
+                    tp_extend_buffer_atr=tp_extend_buffer_atr,
+                    tp_extend_add_atr=tp_extend_add_atr,
+                    recalc_seconds=recalc_seconds,
+                )
+            except Exception as e:
+                self.log("MANAGE_ERROR", cycle_id=trade.cycle_id, error=str(e))
 
-            hit_tp = (p >= tp_price) if direction == "LONG" else (p <= tp_price)
-            hit_sl = (p <= sl_price) if direction == "LONG" else (p >= sl_price)
+            hit_tp = (cur_price >= trade.tp_price) if trade.direction == "LONG" else (cur_price <= trade.tp_price)
+            hit_sl = (cur_price <= trade.sl_price) if trade.direction == "LONG" else (cur_price >= trade.sl_price)
 
-            if hit_tp or hit_sl or t_ms >= deadline:
-                outcome = "TIME"
-                exit_raw = p
-                if hit_tp:
-                    outcome = "TP"
-                    exit_raw = tp_price
-                elif hit_sl:
-                    outcome = "SL"
-                    exit_raw = sl_price
-
-                exit_side = "SELL" if direction == "LONG" else "BUY"
-                exit_exec = apply_slippage(exit_raw, exit_side, slippage_bps)
-
-                gross = qty_btc * (exit_exec - entry_exec) if direction == "LONG" else qty_btc * (entry_exec - exit_exec)
-                notional_entry = qty_btc * entry_exec
-                notional_exit = qty_btc * exit_exec
-                fees = (notional_entry + notional_exit) * fee_rate_per_side
-                net = gross - fees
-
-                return {
-                    "outcome": outcome,
-                    "exit_time_ms": t_ms,
-                    "exit_time": ms_to_iso(t_ms),
-                    "exit_price_raw": exit_raw,
-                    "exit_price_exec": exit_exec,
-                    "gross_pnl_usd": gross,
-                    "fees_usd": fees,
-                    "net_pnl_usd": net,
-                    "tp_price": tp_price,
-                    "sl_price": sl_price,
-                }
+            if hit_tp or hit_sl:
+                outcome = "TP" if hit_tp else "SL"
+                exit_raw = trade.tp_price if hit_tp else trade.sl_price
+                return self._finalize_trade(trade, outcome, exit_raw, fee_rate_per_side, slippage_bps)
 
             await asyncio.sleep(poll_seconds)
 
-        # stopped
+        # TIMEOUT or stopped => close at last price
+        exit_raw = trade.last_price if trade.last_price > 0 else await fetch_price(symbol)
+        return self._finalize_trade(trade, "TIME", exit_raw, fee_rate_per_side, slippage_bps)
+
+    def _finalize_trade(
+        self,
+        trade: TradeState,
+        outcome: Literal["TP", "SL", "TIME"],
+        exit_raw: float,
+        fee_rate_per_side: float,
+        slippage_bps: float,
+    ) -> dict[str, Any]:
         t_ms = now_ms()
-        return {
-            "outcome": "TIME",
+        exit_side: Literal["BUY", "SELL"] = "SELL" if trade.direction == "LONG" else "BUY"
+        exit_exec = apply_slippage(exit_raw, exit_side, slippage_bps)
+
+        gross = trade.qty_btc * (exit_exec - trade.entry_exec) if trade.direction == "LONG" else trade.qty_btc * (trade.entry_exec - exit_exec)
+        notional_entry = trade.qty_btc * trade.entry_exec
+        notional_exit = trade.qty_btc * exit_exec
+        fees = (notional_entry + notional_exit) * fee_rate_per_side
+        net = gross - fees
+
+        # update stats
+        self.stats.trades_total += 1
+        self.by_kind[trade.scenario_kind].trades += 1
+        self.by_key.setdefault(trade.scenario_key, ScenarioTotals()).trades += 1
+
+        if outcome == "TP":
+            self.stats.tp += 1
+            self.by_kind[trade.scenario_kind].tp += 1
+            self.by_key[trade.scenario_key].tp += 1
+        elif outcome == "SL":
+            self.stats.sl += 1
+            self.by_kind[trade.scenario_kind].sl += 1
+            self.by_key[trade.scenario_key].sl += 1
+        else:
+            self.stats.time += 1
+            self.by_kind[trade.scenario_kind].time += 1
+            self.by_key[trade.scenario_key].time += 1
+
+        self.stats.gross_pnl_usd += gross
+        self.stats.fees_usd += fees
+        self.stats.net_pnl_usd += net
+
+        self.by_kind[trade.scenario_kind].gross_pnl_usd += gross
+        self.by_kind[trade.scenario_kind].fees_usd += fees
+        self.by_kind[trade.scenario_kind].net_pnl_usd += net
+
+        self.by_key[trade.scenario_key].gross_pnl_usd += gross
+        self.by_key[trade.scenario_key].fees_usd += fees
+        self.by_key[trade.scenario_key].net_pnl_usd += net
+        # split net PnL by outcome (requested for TP/SL/TIME accumulated values)
+        if outcome == "TP":
+            self.stats.net_tp_usd += net
+            self.by_kind[trade.scenario_kind].net_tp_usd += net
+            self.by_key[trade.scenario_key].net_tp_usd += net
+        elif outcome == "SL":
+            self.stats.net_sl_usd += net
+            self.by_kind[trade.scenario_kind].net_sl_usd += net
+            self.by_key[trade.scenario_key].net_sl_usd += net
+        else:
+            self.stats.net_time_usd += net
+            self.by_kind[trade.scenario_kind].net_time_usd += net
+            self.by_key[trade.scenario_key].net_time_usd += net
+
+        info = {
+            "outcome": outcome,
             "exit_time_ms": t_ms,
             "exit_time": ms_to_iso(t_ms),
-            "exit_price_raw": entry_price_raw,
-            "exit_price_exec": entry_exec,
-            "gross_pnl_usd": 0.0,
-            "fees_usd": 0.0,
-            "net_pnl_usd": 0.0,
+            "exit_price_raw": exit_raw,
+            "exit_price_exec": exit_exec,
+            "gross_pnl_usd": gross,
+            "fees_usd": fees,
+            "net_pnl_usd": net,
+            "tp_price": trade.tp_price,
+            "sl_price": trade.sl_price,
+            "qty_btc": trade.qty_btc,
+            "scenario_key": trade.scenario_key,
+            "scenario_kind": trade.scenario_kind,
+            "direction": trade.direction,
+            "entry_exec": trade.entry_exec,
+            "entry_raw": trade.entry_raw,
         }
+
+        self.log("TRADE_END", cycle_id=trade.cycle_id, **info)
+        self.active_trade = None
+        return info
 
     async def _run(
         self,
@@ -557,7 +872,7 @@ class ScenarioEngine:
         poll_seconds: float = 5.0,
         entry_timeout_seconds: int = 600,
         max_hold_minutes: int = 25,
-        fee_rate_per_side: float = 0.001,   # 0.10% per order
+        fee_rate_per_side: float = 0.001,
         slippage_bps: float = 2.0,
         collateral_usd: float = 1879.0,
         zone_mult_atr: float = 0.35,
@@ -566,16 +881,47 @@ class ScenarioEngine:
         use_ema200: bool = True,
         tp_atr_mult: float = 1.0,
         sl_atr_mult: float = 0.7,
+        # trade management
+        be_trigger_r: float = 0.8,
+        trail_atr_mult: float = 0.8,
+        tp_extend_buffer_atr: float = 0.15,
+        tp_extend_add_atr: float = 0.50,
+        recalc_seconds: float = 30.0,
     ) -> None:
-        self.log("ENGINE_LOOP_PARAMS", symbol=symbol, interval=sanitize_interval(interval), poll_seconds=poll_seconds,
-                 entry_timeout_seconds=entry_timeout_seconds, max_hold_minutes=max_hold_minutes,
-                 fee_rate_per_side=fee_rate_per_side, slippage_bps=slippage_bps, collateral_usd=collateral_usd)
+        self.cfg = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+            "poll_seconds": poll_seconds,
+            "entry_timeout_seconds": entry_timeout_seconds,
+            "max_hold_minutes": max_hold_minutes,
+            "fee_rate_per_side": fee_rate_per_side,
+            "slippage_bps": slippage_bps,
+            "collateral_usd": collateral_usd,
+            "zone_mult_atr": zone_mult_atr,
+            "breakout_buffer_atr": breakout_buffer_atr,
+            "vol_mult": vol_mult,
+            "use_ema200": use_ema200,
+            "tp_atr_mult": tp_atr_mult,
+            "sl_atr_mult": sl_atr_mult,
+            "be_trigger_r": be_trigger_r,
+            "trail_atr_mult": trail_atr_mult,
+            "tp_extend_buffer_atr": tp_extend_buffer_atr,
+            "tp_extend_add_atr": tp_extend_add_atr,
+            "recalc_seconds": recalc_seconds,
+            "binance_base": BINANCE_BASE,
+        }
+
+        self.log("STARTED", cfg=self.cfg)
 
         while self.running:
-            self.cycle_id += 1
-            cid = self.cycle_id
+            async with self.lock:
+                self.cycle_id += 1
+                cid = self.cycle_id
+
             cycle_start = now_ms()
             self.stats.cycles_total += 1
+            self.last_cycle = {"cycle_id": cid, "status": "STARTED", "started_at": ms_to_iso(cycle_start)}
 
             try:
                 candles, snap = await self._snapshot(symbol, interval, limit)
@@ -585,29 +931,42 @@ class ScenarioEngine:
                 continue
 
             self.last_snapshot = snap
-            scenarios = self._build_scenarios(snap, zone_mult_atr, breakout_buffer_atr, vol_mult, use_ema200)
+
+            scenarios = self._build_scenarios(candles, snap, zone_mult_atr, breakout_buffer_atr, vol_mult, use_ema200)
             self.last_scenarios = scenarios
 
             self.log("CYCLE_START", cycle_id=cid, snapshot=asdict(snap))
             for sc in scenarios:
                 self.log("SCENARIO_DEF", cycle_id=cid, scenario=asdict(sc))
 
+            # wait for trigger
             deadline = cycle_start + entry_timeout_seconds * 1000
             triggered: ScenarioDef | None = None
 
             while self.running and now_ms() < deadline and triggered is None:
                 try:
-                    candles, snap2 = await self._snapshot(symbol, interval, limit)
+                    candles2, snap2 = await self._snapshot(symbol, interval, limit)
                     self.last_snapshot = snap2
                 except Exception as e:
                     self.log("POLL_ERROR", cycle_id=cid, error=str(e))
                     await asyncio.sleep(poll_seconds)
                     continue
 
-                triggered = self._check_trigger(candles, snap2, zone_mult_atr, breakout_buffer_atr, vol_mult, use_ema200)
+                # rebuild scenarios using latest snapshot (so the UI matches the same logic)
+                scenarios2 = self._build_scenarios(candles2, snap2, zone_mult_atr, breakout_buffer_atr, vol_mult, use_ema200)
+
+                # deterministic priority: Pullback first, then Breakout (you can invert if wanted)
+                for sc in scenarios2:
+                    if self._scenario_ok(sc):
+                        triggered = sc
+                        break
+
                 if triggered:
+                    self.last_scenarios = scenarios2
                     self.log("TRIGGERED", cycle_id=cid, triggered=asdict(triggered), price=snap2.price)
+                    snap = snap2
                     break
+
                 await asyncio.sleep(poll_seconds)
 
             if not self.running:
@@ -615,132 +974,211 @@ class ScenarioEngine:
 
             if triggered is None:
                 self.stats.no_entry += 1
-                self.last_cycle = {"cycle_id": cid, "status": "NO_ENTRY", "duration_seconds": (now_ms()-cycle_start)/1000.0}
-                self.log("CYCLE_END_NO_ENTRY", cycle_id=cid, duration_s=self.last_cycle["duration_seconds"])
+                dur = (now_ms() - cycle_start) / 1000.0
+                self.last_cycle = {"cycle_id": cid, "status": "NO_ENTRY", "duration_seconds": dur}
+                self.log("CYCLE_END_NO_ENTRY", cycle_id=cid, duration_s=dur)
                 continue
 
+            # enter
             direction: Direction = triggered.direction
-            entry_time = now_ms()
-            raw_price = await fetch_price(symbol)
+            atr_val = float(snap.atr14 or 0.0)
+            raw_price = float(snap.price)
             entry_side = "BUY" if direction == "LONG" else "SELL"
             entry_exec = apply_slippage(raw_price, entry_side, slippage_bps)
-
-            atr_val = (self.last_snapshot.atr14 if (self.last_snapshot and self.last_snapshot.atr14) else None)
-            if atr_val is None:
-                atrs = atr_wilder(candles, 14)
-                atr_val = atrs[-1] or 0.0
-
             qty = collateral_usd / entry_exec if entry_exec > 0 else 0.0
 
-            entry_info = {
-                "entry_time_ms": entry_time,
-                "entry_time": ms_to_iso(entry_time),
-                "entry_price_raw": raw_price,
-                "entry_price_exec": entry_exec,
-                "direction": direction,
-                "qty_btc": qty,
-                "collateral_usd": collateral_usd,
-                "fee_rate_per_side": fee_rate_per_side,
-                "slippage_bps": slippage_bps,
-                "atr14": float(atr_val),
-            }
-            self.log("ENTER", cycle_id=cid, **entry_info)
+            # initial TP/SL
+            tp_dist = atr_val * tp_atr_mult
+            sl_dist = atr_val * sl_atr_mult
+            tp_price = raw_price + tp_dist if direction == "LONG" else raw_price - tp_dist
+            sl_price = raw_price - sl_dist if direction == "LONG" else raw_price + sl_dist
 
-            exit_info = await self._monitor_trade(
-                symbol=symbol,
+            entry_time = now_ms()
+
+            trade = TradeState(
+                cycle_id=cid,
+                scenario_key=triggered.key,
+                scenario_kind=triggered.kind,
                 direction=direction,
-                entry_price_raw=raw_price,
+                entry_time_ms=entry_time,
+                entry_raw=raw_price,
                 entry_exec=entry_exec,
                 qty_btc=qty,
-                tp_atr_mult=tp_atr_mult,
-                sl_atr_mult=sl_atr_mult,
-                atr_value=float(atr_val),
-                slippage_bps=slippage_bps,
-                fee_rate_per_side=fee_rate_per_side,
-                max_hold_minutes=max_hold_minutes,
-                poll_seconds=poll_seconds,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                atr_at_entry=atr_val,
+                last_price=raw_price,
             )
 
-            self.log("EXIT", cycle_id=cid, **exit_info)
+            self.log(
+                "ENTER",
+                cycle_id=cid,
+                scenario_key=trade.scenario_key,
+                scenario_kind=trade.scenario_kind,
+                direction=direction,
+                entry_time=ms_to_iso(entry_time),
+                entry_price_raw=raw_price,
+                entry_price_exec=entry_exec,
+                qty_btc=qty,
+                collateral_usd=collateral_usd,
+                atr14=atr_val,
+                tp_price=tp_price,
+                sl_price=sl_price,
+            )
 
-            status = "ENTERED_TIME"
-            if exit_info["outcome"] == "TP":
-                status = "ENTERED_TP"
-                self.stats.tp += 1
-            elif exit_info["outcome"] == "SL":
-                status = "ENTERED_SL"
-                self.stats.sl += 1
-            else:
-                self.stats.time += 1
+            exit_info = await self._monitor_trade(
+                trade=trade,
+                symbol=symbol,
+                interval=interval,
+                limit=limit,
+                poll_seconds=poll_seconds,
+                fee_rate_per_side=fee_rate_per_side,
+                slippage_bps=slippage_bps,
+                max_hold_minutes=max_hold_minutes,
+                be_trigger_r=be_trigger_r,
+                trail_atr_mult=trail_atr_mult,
+                tp_extend_buffer_atr=tp_extend_buffer_atr,
+                tp_extend_add_atr=tp_extend_add_atr,
+                recalc_seconds=recalc_seconds,
+            )
 
-            duration_s = (now_ms() - cycle_start) / 1000.0
+            dur = (exit_info["exit_time_ms"] - entry_time) / 1000.0
             self.last_cycle = {
                 "cycle_id": cid,
-                "status": status,
-                "duration_seconds": duration_s,
-                "scenario_triggered": asdict(triggered),
-                "entry": entry_info,
-                "exit": exit_info,
+                "status": f"ENTERED_{exit_info['outcome']}",
+                "scenario_key": triggered.key,
+                "scenario_kind": triggered.kind,
+                "duration_seconds": dur,
+                "entry_time": ms_to_iso(entry_time),
+                "exit_time": exit_info["exit_time"],
+                "net_pnl_usd": exit_info["net_pnl_usd"],
             }
-            self.log("CYCLE_END", cycle_id=cid, status=status, duration_s=duration_s)
+            self.log("CYCLE_END", cycle_id=cid, summary=self.last_cycle)
 
-engine = ScenarioEngine()
+            await asyncio.sleep(0.25)
 
-app = FastAPI(title="BTC Scenario Logger", version="1.0.0")
+        self.log("STOPPED")
+
+    async def start(self, **cfg: Any) -> None:
+        async with self.lock:
+            if self.running:
+                return
+            self.running = True
+            self.task = asyncio.create_task(self._run(**cfg))
+
+    async def stop(self) -> None:
+        async with self.lock:
+            self.running = False
+            t = self.task
+            self.task = None
+        if t:
+            try:
+                await asyncio.wait_for(t, timeout=2.0)
+            except Exception:
+                pass
+        self.active_trade = None
+        self.log("STOP_REQUESTED")
+
+    def reset(self) -> None:
+        self.running = False
+        self.task = None
+        self.logs = []
+        self.stats = EngineStats()
+        self.by_kind = {"PULLBACK": ScenarioTotals(), "BREAKOUT": ScenarioTotals()}
+        self.by_key = {}
+        self.last_snapshot = None
+        self.last_scenarios = []
+        self.last_cycle = None
+        self.active_trade = None
+        self.cycle_id = 0
+        self.cfg = {}
+        self.log("RESET_DONE")
+
+# -------------------------
+# FastAPI
+# -------------------------
+
+app = FastAPI(title="BTC Scenarios Logger", version="11.0")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+engine = ScenarioEngine()
+
 @app.get("/health")
 def health():
-    return {"ok": True, "ts": ms_to_iso(now_ms())}
+    return {"ok": True, "ts": ms_to_iso(now_ms()), "binance_base": BINANCE_BASE}
+
+@app.get("/api/version")
+def api_version():
+    return {
+        "version": "11.1",
+        "ts": ms_to_iso(now_ms()),
+        "binance_base": BINANCE_BASE,
+    }
+
 
 @app.post("/api/start")
 async def api_start(
     symbol: str = Query("BTCUSDT"),
     interval: str = Query("3m"),
     collateral_usd: float = Query(1879.0, gt=0),
-    poll_seconds: float = Query(5.0, ge=1.0, le=30.0),
+    poll_seconds: float = Query(5.0, ge=1.0, le=60.0),
     entry_timeout_seconds: int = Query(600, ge=5, le=7200),
     max_hold_minutes: int = Query(25, ge=1, le=240),
-    fee_rate_per_side: float = Query(0.001, ge=0.0, le=0.01),
-    slippage_bps: float = Query(2.0, ge=0.0, le=50.0),
-    zone_mult_atr: float = Query(0.35, gt=0.0, le=2.0),
-    breakout_buffer_atr: float = Query(0.20, gt=0.0, le=2.0),
-    vol_mult: float = Query(1.10, gt=0.5, le=5.0),
+    fee_rate_per_side: float = Query(0.001, ge=0.0, le=0.02),
+    slippage_bps: float = Query(2.0, ge=0.0, le=100.0),
+    zone_mult_atr: float = Query(0.35, ge=0.0, le=5.0),
+    breakout_buffer_atr: float = Query(0.20, ge=0.0, le=5.0),
+    vol_mult: float = Query(1.10, ge=0.1, le=10.0),
     use_ema200: bool = Query(True),
-    tp_atr_mult: float = Query(1.0, gt=0.1, le=10.0),
-    sl_atr_mult: float = Query(0.7, gt=0.1, le=10.0),
+    tp_atr_mult: float = Query(1.0, ge=0.1, le=10.0),
+    sl_atr_mult: float = Query(0.7, ge=0.1, le=10.0),
+    # management
+    be_trigger_r: float = Query(0.8, ge=0.1, le=5.0),
+    trail_atr_mult: float = Query(0.8, ge=0.1, le=10.0),
+    tp_extend_buffer_atr: float = Query(0.15, ge=0.01, le=5.0),
+    tp_extend_add_atr: float = Query(0.50, ge=0.0, le=10.0),
+    recalc_seconds: float = Query(30.0, ge=5.0, le=120.0),
+    limit: int = Query(500, ge=50, le=1000),
 ):
     await engine.start(
         symbol=symbol,
-        interval=sanitize_interval(interval),
-        collateral_usd=collateral_usd,
+        interval=interval,
+        limit=limit,
         poll_seconds=poll_seconds,
         entry_timeout_seconds=entry_timeout_seconds,
         max_hold_minutes=max_hold_minutes,
         fee_rate_per_side=fee_rate_per_side,
         slippage_bps=slippage_bps,
+        collateral_usd=collateral_usd,
         zone_mult_atr=zone_mult_atr,
         breakout_buffer_atr=breakout_buffer_atr,
         vol_mult=vol_mult,
         use_ema200=use_ema200,
         tp_atr_mult=tp_atr_mult,
         sl_atr_mult=sl_atr_mult,
+        be_trigger_r=be_trigger_r,
+        trail_atr_mult=trail_atr_mult,
+        tp_extend_buffer_atr=tp_extend_buffer_atr,
+        tp_extend_add_atr=tp_extend_add_atr,
+        recalc_seconds=recalc_seconds,
     )
-    return {"running": engine.running}
+    return {"ok": True, "running": engine.running, "cfg": engine.cfg}
 
 @app.post("/api/stop")
 async def api_stop():
     await engine.stop()
-    return {"running": engine.running}
+    return {"ok": True, "running": engine.running}
 
 @app.post("/api/reset")
-async def api_reset():
-    await engine.reset()
+def api_reset():
+    engine.reset()
     return {"ok": True}
 
 @app.get("/api/status")
@@ -748,30 +1186,43 @@ def api_status():
     return {
         "running": engine.running,
         "stats": asdict(engine.stats),
+        "by_kind": {k: asdict(v) for k, v in engine.by_kind.items()},
+        "by_key": {k: asdict(v) for k, v in engine.by_key.items()},
         "last_snapshot": asdict(engine.last_snapshot) if engine.last_snapshot else None,
         "last_scenarios": [asdict(s) for s in engine.last_scenarios],
         "last_cycle": engine.last_cycle,
+        "active_trade": asdict(engine.active_trade) if engine.active_trade else None,
         "logs_len": len(engine.logs),
         "cfg": engine.cfg,
     }
 
+@app.get("/api/logs")
+def api_logs(
+    hours: int = Query(12, ge=1, le=72),
+    limit: int = Query(20000, ge=1, le=60000),
+):
+    cutoff = now_ms() - hours * 3600_000
+    rows = [r for r in engine.logs if int(r.get("ts_ms", 0)) >= cutoff]
+    return {"logs": rows[-int(limit):], "hours": hours, "returned": min(len(rows), int(limit))}
 
 @app.get("/api/conditions")
-async def api_conditions(limit: int = Query(500, ge=50, le=1000)):
-    cfg = engine.cfg or {}
-    symbol = cfg.get("symbol", "BTCUSDT")
-    interval = cfg.get("interval", "3m")
-    zone_mult_atr = float(cfg.get("zone_mult_atr", 0.35))
-    breakout_buffer_atr = float(cfg.get("breakout_buffer_atr", 0.20))
-    vol_mult = float(cfg.get("vol_mult", 1.10))
-    use_ema200 = bool(cfg.get("use_ema200", True))
+async def api_conditions(
+    symbol: str = Query("BTCUSDT"),
+    interval: str = Query("3m"),
+    zone_mult_atr: float = Query(0.35, ge=0.0, le=5.0),
+    breakout_buffer_atr: float = Query(0.20, ge=0.0, le=5.0),
+    vol_mult: float = Query(1.10, ge=0.1, le=10.0),
+    use_ema200: bool = Query(True),
+    limit: int = Query(500, ge=50, le=1000),
+):
     try:
         candles, snap = await engine._snapshot(symbol, interval, limit)
+        scs = engine._build_scenarios(candles, snap, zone_mult_atr, breakout_buffer_atr, vol_mult, use_ema200)
+        return {
+            "ok": True,
+            "snapshot": asdict(snap),
+            "scenarios": [asdict(s) for s in scs],
+        }
     except Exception as e:
         engine.log("CONDITIONS_ERROR", error=str(e))
         return {"ok": False, "error": str(e)}
-    return engine.build_conditions(candles, snap, zone_mult_atr, breakout_buffer_atr, vol_mult, use_ema200)
-
-@app.get("/api/logs")
-def api_logs(limit: int = Query(300, ge=1, le=2000)):
-    return {"logs": engine.logs[-int(limit):]}
