@@ -239,7 +239,7 @@ class ScenarioEngine:
             self.last_cycle = None
             self.cycle_id = 0
             self.cfg = {}
-        self.log("RESET_DONE")
+            self.log("RESET_DONE")
 
     async def _snapshot(self, symbol: str, interval: str, limit: int) -> tuple[list[Candle], AnalysisSnapshot]:
         candles = await fetch_klines(symbol, interval=sanitize_interval(interval), limit=limit)
