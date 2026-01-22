@@ -17,3 +17,7 @@ uvicorn main:app --reload --port 8000
 - GET `/api/logs?limit=300` logs
 
 > É um logger/estudo (não executa ordens reais).
+
+
+### Binance endpoint
+Por padrão usa `https://data-api.binance.vision` (market data). Você pode trocar definindo a env `BINANCE_SPOT_BASE`.

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -11,7 +12,20 @@ import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-BINANCE_SPOT_BASE = "https://api.binance.com"
+BINANCE_SPOT_BASE = os.getenv("BINANCE_SPOT_BASE", "https://data-api.binance.vision")
+
+
+ALLOWED_INTERVALS = {"1m","3m","5m","15m","30m","1h","2h","4h","6h","8h","12h","1d","3d","1w","1M"}
+
+def sanitize_interval(interval: str | None, default: str = "3m") -> str:
+    if interval is None:
+        return default
+    iv = str(interval).strip()
+    if iv == "" or iv.lower() == "undefined" or iv.lower() == "null":
+        return default
+    if iv not in ALLOWED_INTERVALS:
+        return default
+    return iv
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -43,7 +57,7 @@ class Candle:
 
 async def fetch_klines(symbol: str, interval: str, limit: int = 500) -> list[Candle]:
     url = f"{BINANCE_SPOT_BASE}/api/v3/klines"
-    params: dict[str, Any] = {"symbol": symbol.upper(), "interval": interval, "limit": int(limit)}
+    params: dict[str, Any] = {"symbol": symbol.upper(), "interval": sanitize_interval(interval), "limit": int(limit)}
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(url, params=params)
         r.raise_for_status()
@@ -225,7 +239,7 @@ class ScenarioEngine:
             self.log("RESET_DONE")
 
     async def _snapshot(self, symbol: str, interval: str, limit: int) -> tuple[list[Candle], AnalysisSnapshot]:
-        candles = await fetch_klines(symbol, interval=interval, limit=limit)
+        candles = await fetch_klines(symbol, interval=sanitize_interval(interval), limit=limit)
         price = candles[-1].close
         closes = [c.close for c in candles]
         ema200s = ema(closes, 200)
@@ -242,7 +256,7 @@ class ScenarioEngine:
         snap = AnalysisSnapshot(
             ts_ms=now_ms(),
             symbol=symbol.upper(),
-            interval=interval,
+            interval=sanitize_interval(interval),
             price=float(price),
             vwap=vwap,
             ema200=ema200s[-1],
@@ -445,7 +459,7 @@ class ScenarioEngine:
         tp_atr_mult: float = 1.0,
         sl_atr_mult: float = 0.7,
     ) -> None:
-        self.log("ENGINE_LOOP_PARAMS", symbol=symbol, interval=interval, poll_seconds=poll_seconds,
+        self.log("ENGINE_LOOP_PARAMS", symbol=symbol, interval=sanitize_interval(interval), poll_seconds=poll_seconds,
                  entry_timeout_minutes=entry_timeout_minutes, max_hold_minutes=max_hold_minutes,
                  fee_rate_per_side=fee_rate_per_side, slippage_bps=slippage_bps, collateral_usd=collateral_usd)
 
@@ -595,7 +609,7 @@ async def api_start(
 ):
     await engine.start(
         symbol=symbol,
-        interval=interval,
+        interval=sanitize_interval(interval),
         collateral_usd=collateral_usd,
         poll_seconds=poll_seconds,
         entry_timeout_minutes=entry_timeout_minutes,
