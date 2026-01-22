@@ -367,111 +367,111 @@ class ScenarioEngine:
         return None
 
     
-def build_conditions(
-    self,
-    candles: list[Candle],
-    snap: AnalysisSnapshot,
-    zone_mult_atr: float,
-    breakout_buffer_atr: float,
-    vol_mult: float,
-    use_ema200: bool,
-) -> dict[str, Any]:
-    if len(candles) < 25:
-        return {"ok": False, "reason": "not_enough_candles"}
+    def build_conditions(
+        self,
+        candles: list[Candle],
+        snap: AnalysisSnapshot,
+        zone_mult_atr: float,
+        breakout_buffer_atr: float,
+        vol_mult: float,
+        use_ema200: bool,
+    ) -> dict[str, Any]:
+        if len(candles) < 25:
+            return {"ok": False, "reason": "not_enough_candles"}
 
-    last = candles[-1]
-    prev = candles[-2]
-    vwap = snap.vwap
-    atr = snap.atr14
-    rsi14 = snap.rsi14
-    ema200 = snap.ema200
-    avgv = snap.avg_vol20
-    rh = snap.recent_high
-    rl = snap.recent_low
+        last = candles[-1]
+        prev = candles[-2]
+        vwap = snap.vwap
+        atr = snap.atr14
+        rsi14 = snap.rsi14
+        ema200 = snap.ema200
+        avgv = snap.avg_vol20
+        rh = snap.recent_high
+        rl = snap.recent_low
 
-    if vwap is None or atr is None or rsi14 is None or avgv is None or rh is None or rl is None:
-        return {"ok": False, "reason": "missing_indicators"}
+        if vwap is None or atr is None or rsi14 is None or avgv is None or rh is None or rl is None:
+            return {"ok": False, "reason": "missing_indicators"}
 
-    zone = max(atr * zone_mult_atr, atr * 0.25)
-    buf = atr * breakout_buffer_atr
+        zone = max(atr * zone_mult_atr, atr * 0.25)
+        buf = atr * breakout_buffer_atr
 
-    def ema_ok(direction: Direction) -> tuple[bool, float | None]:
-        if not use_ema200 or ema200 is None:
-            return True, ema200
-        return ((last.close > ema200) if direction == "LONG" else (last.close < ema200)), ema200
+        def ema_ok(direction: Direction) -> tuple[bool, float | None]:
+            if not use_ema200 or ema200 is None:
+                return True, ema200
+            return ((last.close > ema200) if direction == "LONG" else (last.close < ema200)), ema200
 
-    vwap_dn = vwap - zone
-    vwap_up = vwap + zone
-    touch_zone = (prev.low <= vwap_up and prev.high >= vwap_dn) or (snap.price >= vwap_dn and snap.price <= vwap_up)
+        vwap_dn = vwap - zone
+        vwap_up = vwap + zone
+        touch_zone = (prev.low <= vwap_up and prev.high >= vwap_dn) or (snap.price >= vwap_dn and snap.price <= vwap_up)
 
-    scenarios: list[dict[str, Any]] = []
+        scenarios: list[dict[str, Any]] = []
 
-    ema_ok_long, ema_val = ema_ok("LONG")
-    scenarios.append({
-        "key": "PULLBACK_LONG",
-        "name": "Cenário 1 — Pullback LONG (VWAP)",
-        "direction": "LONG",
-        "conditions": [
-            {"label": "Preço tocou a zona VWAP±", "current": snap.price, "target": {"vwap": vwap, "range": [vwap_dn, vwap_up]}, "ok": bool(touch_zone)},
-            {"label": "Fechou acima do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close > vwap)},
-            {"label": "RSI(14) >= 50", "current": rsi14, "target": 50, "ok": bool(rsi14 >= 50)},
-            {"label": "Filtro EMA200 (preço > EMA200)", "current": last.close, "target": ema_val, "ok": bool(ema_ok_long)},
-        ],
-    })
+        ema_ok_long, ema_val = ema_ok("LONG")
+        scenarios.append({
+            "key": "PULLBACK_LONG",
+            "name": "Cenário 1 — Pullback LONG (VWAP)",
+            "direction": "LONG",
+            "conditions": [
+                {"label": "Preço tocou a zona VWAP±", "current": snap.price, "target": {"vwap": vwap, "range": [vwap_dn, vwap_up]}, "ok": bool(touch_zone)},
+                {"label": "Fechou acima do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close > vwap)},
+                {"label": "RSI(14) >= 50", "current": rsi14, "target": 50, "ok": bool(rsi14 >= 50)},
+                {"label": "Filtro EMA200 (preço > EMA200)", "current": last.close, "target": ema_val, "ok": bool(ema_ok_long)},
+            ],
+        })
 
-    ema_ok_short, ema_val2 = ema_ok("SHORT")
-    scenarios.append({
-        "key": "PULLBACK_SHORT",
-        "name": "Cenário 1 — Pullback SHORT (VWAP)",
-        "direction": "SHORT",
-        "conditions": [
-            {"label": "Preço tocou a zona VWAP±", "current": snap.price, "target": {"vwap": vwap, "range": [vwap_dn, vwap_up]}, "ok": bool(touch_zone)},
-            {"label": "Fechou abaixo do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close < vwap)},
-            {"label": "RSI(14) <= 50", "current": rsi14, "target": 50, "ok": bool(rsi14 <= 50)},
-            {"label": "Filtro EMA200 (preço < EMA200)", "current": last.close, "target": ema_val2, "ok": bool(ema_ok_short)},
-        ],
-    })
+        ema_ok_short, ema_val2 = ema_ok("SHORT")
+        scenarios.append({
+            "key": "PULLBACK_SHORT",
+            "name": "Cenário 1 — Pullback SHORT (VWAP)",
+            "direction": "SHORT",
+            "conditions": [
+                {"label": "Preço tocou a zona VWAP±", "current": snap.price, "target": {"vwap": vwap, "range": [vwap_dn, vwap_up]}, "ok": bool(touch_zone)},
+                {"label": "Fechou abaixo do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close < vwap)},
+                {"label": "RSI(14) <= 50", "current": rsi14, "target": 50, "ok": bool(rsi14 <= 50)},
+                {"label": "Filtro EMA200 (preço < EMA200)", "current": last.close, "target": ema_val2, "ok": bool(ema_ok_short)},
+            ],
+        })
 
-    trig_long = rh + buf
-    ema_ok_long2, ema_val3 = ema_ok("LONG")
-    scenarios.append({
-        "key": "BREAKOUT_LONG",
-        "name": "Cenário 2 — Breakout LONG (confirmado)",
-        "direction": "LONG",
-        "conditions": [
-            {"label": "Fechou acima do gatilho (topo+buffer)", "current": last.close, "target": trig_long, "ok": bool(last.close > trig_long), "extra": {"recent_high": rh, "buffer": buf}},
-            {"label": "Fechou acima do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close > vwap)},
-            {"label": "RSI(14) >= 55", "current": rsi14, "target": 55, "ok": bool(rsi14 >= 55)},
-            {"label": "Volume >= X * média(20)", "current": last.volume, "target": avgv * vol_mult, "ok": bool(last.volume >= avgv * vol_mult), "extra": {"avg20": avgv, "mult": vol_mult}},
-            {"label": "Filtro EMA200 (preço > EMA200)", "current": last.close, "target": ema_val3, "ok": bool(ema_ok_long2)},
-        ],
-    })
+        trig_long = rh + buf
+        ema_ok_long2, ema_val3 = ema_ok("LONG")
+        scenarios.append({
+            "key": "BREAKOUT_LONG",
+            "name": "Cenário 2 — Breakout LONG (confirmado)",
+            "direction": "LONG",
+            "conditions": [
+                {"label": "Fechou acima do gatilho (topo+buffer)", "current": last.close, "target": trig_long, "ok": bool(last.close > trig_long), "extra": {"recent_high": rh, "buffer": buf}},
+                {"label": "Fechou acima do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close > vwap)},
+                {"label": "RSI(14) >= 55", "current": rsi14, "target": 55, "ok": bool(rsi14 >= 55)},
+                {"label": "Volume >= X * média(20)", "current": last.volume, "target": avgv * vol_mult, "ok": bool(last.volume >= avgv * vol_mult), "extra": {"avg20": avgv, "mult": vol_mult}},
+                {"label": "Filtro EMA200 (preço > EMA200)", "current": last.close, "target": ema_val3, "ok": bool(ema_ok_long2)},
+            ],
+        })
 
-    trig_short = rl - buf
-    ema_ok_short2, ema_val4 = ema_ok("SHORT")
-    scenarios.append({
-        "key": "BREAKOUT_SHORT",
-        "name": "Cenário 2 — Breakout SHORT (confirmado)",
-        "direction": "SHORT",
-        "conditions": [
-            {"label": "Fechou abaixo do gatilho (fundo-buffer)", "current": last.close, "target": trig_short, "ok": bool(last.close < trig_short), "extra": {"recent_low": rl, "buffer": buf}},
-            {"label": "Fechou abaixo do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close < vwap)},
-            {"label": "RSI(14) <= 45", "current": rsi14, "target": 45, "ok": bool(rsi14 <= 45)},
-            {"label": "Volume >= X * média(20)", "current": last.volume, "target": avgv * vol_mult, "ok": bool(last.volume >= avgv * vol_mult), "extra": {"avg20": avgv, "mult": vol_mult}},
-            {"label": "Filtro EMA200 (preço < EMA200)", "current": last.close, "target": ema_val4, "ok": bool(ema_ok_short2)},
-        ],
-    })
+        trig_short = rl - buf
+        ema_ok_short2, ema_val4 = ema_ok("SHORT")
+        scenarios.append({
+            "key": "BREAKOUT_SHORT",
+            "name": "Cenário 2 — Breakout SHORT (confirmado)",
+            "direction": "SHORT",
+            "conditions": [
+                {"label": "Fechou abaixo do gatilho (fundo-buffer)", "current": last.close, "target": trig_short, "ok": bool(last.close < trig_short), "extra": {"recent_low": rl, "buffer": buf}},
+                {"label": "Fechou abaixo do VWAP", "current": last.close, "target": vwap, "ok": bool(last.close < vwap)},
+                {"label": "RSI(14) <= 45", "current": rsi14, "target": 45, "ok": bool(rsi14 <= 45)},
+                {"label": "Volume >= X * média(20)", "current": last.volume, "target": avgv * vol_mult, "ok": bool(last.volume >= avgv * vol_mult), "extra": {"avg20": avgv, "mult": vol_mult}},
+                {"label": "Filtro EMA200 (preço < EMA200)", "current": last.close, "target": ema_val4, "ok": bool(ema_ok_short2)},
+            ],
+        })
 
-    return {
-        "ok": True,
-        "ts_ms": now_ms(),
-        "ts": ms_to_iso(now_ms()),
-        "symbol": snap.symbol,
-        "interval": snap.interval,
-        "scenarios": scenarios,
-    }
+        return {
+            "ok": True,
+            "ts_ms": now_ms(),
+            "ts": ms_to_iso(now_ms()),
+            "symbol": snap.symbol,
+            "interval": snap.interval,
+            "scenarios": scenarios,
+        }
 
-async def _monitor_trade(
+    async def _monitor_trade(
         self,
         symbol: str,
         direction: Direction,
