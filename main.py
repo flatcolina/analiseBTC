@@ -110,16 +110,16 @@ def macd_series(closes: list[float], fast_period: int = 12, slow_period: int = 2
     """Calcula MACD, Linha de Sinal e Histograma."""
     ema_fast = ema_series(closes, fast_period)
     ema_slow = ema_series(closes, slow_period)
-    
+
     macd_line: list[Optional[float]] = [None] * len(closes)
     for i in range(len(closes)):
         if ema_fast[i] is not None and ema_slow[i] is not None:
             macd_line[i] = ema_fast[i] - ema_slow[i]
-    
+
     # Calcular a linha de sinal (EMA da linha MACD)
     macd_values = [v for v in macd_line if v is not None]
     signal_line_raw = ema_series(macd_values, signal_period)
-    
+
     # Mapear a linha de sinal de volta para o tamanho original
     signal_line: list[Optional[float]] = [None] * len(closes)
     j = 0
@@ -128,37 +128,37 @@ def macd_series(closes: list[float], fast_period: int = 12, slow_period: int = 2
             if j < len(signal_line_raw):
                 signal_line[i] = signal_line_raw[j]
                 j += 1
-    
+
     # Calcular o histograma
     histogram: list[Optional[float]] = [None] * len(closes)
     for i in range(len(closes)):
         if macd_line[i] is not None and signal_line[i] is not None:
             histogram[i] = macd_line[i] - signal_line[i]
-            
+
     return macd_line, signal_line, histogram
 
 def compute_indicators(candles: list[Candle]) -> list[Candle]:
     """Calcula e atribui todos os indicadores necessários aos objetos Candle."""
     closes = [c.close for c in candles]
-    
+
     # EMAs (9, 21, 55, 200)
     ema9s = ema_series(closes, 9)
     ema21s = ema_series(closes, 21)
     ema55s = ema_series(closes, 55)
     ema200s = ema_series(closes, 200)
-    
+
     # RSI
     rsis = rsi_series(candles, 14)
-    
+
     # ATR
     atrs = atr_wilder_series(candles, 14)
-    
+
     # VWAP (Rolling 100)
     vwaps = [vwap_rolling(candles[:i+1], 100) for i in range(len(candles))]
-    
+
     # MACD
     macd_line, signal_line, histogram = macd_series(closes)
-    
+
     for i, c in enumerate(candles):
         c.ema9 = ema9s[i]
         c.ema21 = ema21s[i]
@@ -170,7 +170,7 @@ def compute_indicators(candles: list[Candle]) -> list[Candle]:
         c.macd = macd_line[i]
         c.macd_signal = signal_line[i]
         c.macd_hist = histogram[i]
-        
+
     return candles
 
 def parse_klines(rows: list[list[Any]]) -> list[Candle]:
@@ -384,62 +384,62 @@ class ScenarioEngine:
         self.cycle_id: int = 0
         self.cfg: dict[str, Any] = {}
 
-	        self.retention_ms: int = int(os.getenv("LOG_RETENTION_HOURS", "12")) * 3600_000
-	
-	    def _prune_logs(self) -> None:
-	        if not self.logs:
-	            return
-	        cutoff = now_ms() - self.retention_ms
-	        # prune from front
-	        i = 0
-	        while i < len(self.logs) and int(self.logs[i].get("ts_ms", 0)) < cutoff:
-	            i += 1
-	        if i > 0:
-	            self.logs = self.logs[i:]
-	
-	        # extra safety cap
-	        cap = int(os.getenv("LOG_MAX_ROWS", "60000"))
-	        if len(self.logs) > cap:
-	            self.logs = self.logs[-cap:]
-	
-	    def log(self, event: str, **data: Any) -> None:
-	        ts = now_ms()
-	        row = {"ts_ms": ts, "ts": ms_to_iso(ts), "event": event, **data}
-	        self.logs.append(row)
-	        self._prune_logs()
-	
-	    async def _snapshot(self, symbol: str, interval: str, limit: int) -> tuple[list[Candle], AnalysisSnapshot]:
-	        raw = await fetch_klines(symbol, interval, limit)
-	        candles = parse_klines(raw)
-	        if not candles:
-	            raise RuntimeError("No candles returned")
-	        
-	        # Compute all indicators for the full list of candles
-	        candles = compute_indicators(candles)
-	        
-	        price = candles[-1].close
-	        
-	        # The original snapshot only needs a few indicators for the old scenarios
-	        avg_vol = avg_volume(candles, 20)
-	        lookback = 20
-	        recent = candles[-lookback:] if len(candles) >= lookback else candles
-	        rh = max(c.high for c in recent) if recent else None
-	        rl = min(c.low for c in recent) if recent else None
-	        
-	        snap = AnalysisSnapshot(
-	            ts_ms=now_ms(),
-	            symbol=symbol,
-	            interval=interval,
-	            price=float(price),
-	            vwap=float(candles[-1].vwap) if candles[-1].vwap is not None else None,
-	            ema200=float(candles[-1].ema200) if candles[-1].ema200 is not None else None,
-	            rsi14=float(candles[-1].rsi) if candles[-1].rsi is not None else None,
-	            atr14=float(candles[-1].atr) if candles[-1].atr is not None else None,
-	            avg_vol20=avg_vol,
-	            recent_high=rh,
-	            recent_low=rl,
-	        )
-	        return candles, snap
+            self.retention_ms: int = int(os.getenv("LOG_RETENTION_HOURS", "12")) * 3600_000
+
+        def _prune_logs(self) -> None:
+            if not self.logs:
+                return
+            cutoff = now_ms() - self.retention_ms
+            # prune from front
+            i = 0
+            while i < len(self.logs) and int(self.logs[i].get("ts_ms", 0)) < cutoff:
+                i += 1
+            if i > 0:
+                self.logs = self.logs[i:]
+
+            # extra safety cap
+            cap = int(os.getenv("LOG_MAX_ROWS", "60000"))
+            if len(self.logs) > cap:
+                self.logs = self.logs[-cap:]
+
+        def log(self, event: str, **data: Any) -> None:
+            ts = now_ms()
+            row = {"ts_ms": ts, "ts": ms_to_iso(ts), "event": event, **data}
+            self.logs.append(row)
+            self._prune_logs()
+
+        async def _snapshot(self, symbol: str, interval: str, limit: int) -> tuple[list[Candle], AnalysisSnapshot]:
+            raw = await fetch_klines(symbol, interval, limit)
+            candles = parse_klines(raw)
+            if not candles:
+                raise RuntimeError("No candles returned")
+
+            # Compute all indicators for the full list of candles
+            candles = compute_indicators(candles)
+
+            price = candles[-1].close
+
+            # The original snapshot only needs a few indicators for the old scenarios
+            avg_vol = avg_volume(candles, 20)
+            lookback = 20
+            recent = candles[-lookback:] if len(candles) >= lookback else candles
+            rh = max(c.high for c in recent) if recent else None
+            rl = min(c.low for c in recent) if recent else None
+
+            snap = AnalysisSnapshot(
+                ts_ms=now_ms(),
+                symbol=symbol,
+                interval=interval,
+                price=float(price),
+                vwap=float(candles[-1].vwap) if candles[-1].vwap is not None else None,
+                ema200=float(candles[-1].ema200) if candles[-1].ema200 is not None else None,
+                rsi14=float(candles[-1].rsi) if candles[-1].rsi is not None else None,
+                atr14=float(candles[-1].atr) if candles[-1].atr is not None else None,
+                avg_vol20=avg_vol,
+                recent_high=rh,
+                recent_low=rl,
+            )
+            return candles, snap
 
     def _build_scenarios(
         self,
@@ -1567,38 +1567,15 @@ async def get_full_analysis(
     """Retorna a análise completa de scalping (5 algoritmos)"""
     raw = await fetch_klines(symbol, interval, limit)
     candles = parse_klines(raw)
-    
+
     # Computar todos os indicadores
     candles = compute_indicators(candles)
-    
+
     # Executar a análise completa
     analysis_dict = analyzer.get_full_analysis(candles, capital)
-    
+
     # Converter o dicionário de volta para o modelo Pydantic/dataclass
     return FullAnalysis(**analysis_dict)
-    capital: float = Query(10000.0),
-) -> dict[str, Any]:
-    """
-    Retorna a análise completa dos 5 algoritmos de scalping.
-    """
-    try:
-        klines = await fetch_klines(symbol, interval, limit)
-        candles = parse_klines(klines)
-        candles = compute_indicators(candles)
-        
-        # Apenas a última vela é necessária para a análise
-        if not candles:
-            return {"error": "No market data available"}
-
-        # Executa a análise completa
-        analysis_result = scalping_analyzer.get_full_analysis(candles, capital)
-        
-        # Converte o resultado da dataclass para dict
-        return asdict(analysis_result)
-
-    except Exception as e:
-        print(f"Error in get_full_analysis: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/conditions")
 async def api_conditions(
@@ -1634,10 +1611,10 @@ async def api_full_analysis(
         # Reutilizar a lógica de snapshot do engine
         raw_klines = await fetch_klines(symbol, interval, limit)
         candles = parse_klines(raw_klines)
-        
+
         # Executar a análise completa
         analysis_result = scalping_analyzer.analyze_all(candles, capital)
-        
+
         return {"ok": True, **analysis_result}
     except Exception as e:
         return {"ok": False, "error": str(e)}

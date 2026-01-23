@@ -46,17 +46,17 @@ class ScalpingAnalyzer:
 
         # 1. Converter candles para o formato esperado pelos algoritmos
         candles_dict = _convert_candles_to_dict(candles)
-        
+
         # 2. Executar os detectores de setup (Algoritmos 1 e 2)
         long_setup = self.long_detector.detect_setup(candles_dict)
         short_setup = self.short_detector.detect_setup(candles_dict)
-        
+
         # 3. Executar análise de Momentum (Algoritmo 3)
         momentum_signals = self.momentum_detector.analyze(candles_dict)
-        
+
         # 4. Executar análise de Tendência (Algoritmo 4)
         trend_analysis = self.trend_detector.analyze(candles_dict)
-        
+
         # 5. Executar Sistema de Score Dinâmico (Algoritmo 5)
         score_analysis = self.score_system.analyze(candles_dict, capital=capital)
 
@@ -70,94 +70,94 @@ class ScalpingAnalyzer:
             "trend_analysis": asdict(trend_analysis) if trend_analysis else None,
             "score_analysis": asdict(score_analysis) if score_analysis else None,
         }
-        
-	        # Limpar enum values para strings no score_analysis
-	        # Isso não é mais necessário se os algoritmos usarem as dataclasses de models.py
-	        # e o _safe_asdict for usado corretamente.
-	        
-	        # O problema é que os algoritmos originais usam classes internas com Enums.
-	        # Vamos manter o _safe_asdict e o _clean_dataclass_dict, mas simplificar a classe principal.
-	        
-	        # 6. Compilar resultados
-	        # Usar a dataclass FullAnalysis para garantir a estrutura de saída
-	        full_analysis = FullAnalysis(
-	            snapshot=candles[-1], # A última vela já tem todos os indicadores
-	            long_setup=_safe_asdict(long_setup),
-	            short_setup=_safe_asdict(short_setup),
-	            momentum_analysis=[_safe_asdict(s) for s in momentum_signals],
-	            trend_analysis=_safe_asdict(trend_analysis),
-	            score_analysis=_safe_asdict(score_analysis),
-	        )
-	        
-	        # Retornar o dicionário da dataclass FullAnalysis
-	        return dataclass_asdict(full_analysis)
 
-	# Helper para limpar Enums e converter dataclasses para dict
-	def _clean_dataclass_dict(data: Dict) -> Dict:
-	    """Limpa os dicionários de dataclasses, convertendo Enums para strings."""
-	    if isinstance(data, dict):
-	        return {k: _clean_dataclass_dict(v) for k, v in data.items()}
-	    elif isinstance(data, list):
-	        return [_clean_dataclass_dict(v) for v in data]
-	    elif hasattr(data, 'value'):
-	        return data.value
-	    return data
+            # Limpar enum values para strings no score_analysis
+            # Isso não é mais necessário se os algoritmos usarem as dataclasses de models.py
+            # e o _safe_asdict for usado corretamente.
 
-	def _safe_asdict(obj):
-	    """Tenta usar dataclasses.asdict e limpa Enums. Usado para os resultados dos algoritmos."""
-	    try:
-	        data = dataclass_asdict(obj)
-	        return _clean_dataclass_dict(data)
-	    except TypeError:
-	        # Se não for um dataclass, retorna o objeto
-	        return obj
+            # O problema é que os algoritmos originais usam classes internas com Enums.
+            # Vamos manter o _safe_asdict e o _clean_dataclass_dict, mas simplificar a classe principal.
 
-	class ScalpingAnalyzer:
-	    """
-	    Classe principal para executar a análise de scalping integrada.
-	    """
-	    def __init__(self):
-	        # Instanciar os detectores dos algoritmos originais
-	        self.long_detector = ConfluenceLongDetector()
-	        self.short_detector = ConfluenceShortDetector()
-	        self.momentum_detector = MomentumDetector()
-	        self.trend_detector = TrendDetector()
-	        self.score_system = DynamicScoreSystem()
+            # 6. Compilar resultados
+            # Usar a dataclass FullAnalysis para garantir a estrutura de saída
+            full_analysis = FullAnalysis(
+                snapshot=candles[-1], # A última vela já tem todos os indicadores
+                long_setup=_safe_asdict(long_setup),
+                short_setup=_safe_asdict(short_setup),
+                momentum_analysis=[_safe_asdict(s) for s in momentum_signals],
+                trend_analysis=_safe_asdict(trend_analysis),
+                score_analysis=_safe_asdict(score_analysis),
+            )
 
-	    def get_full_analysis(self, candles: List[Candle], capital: float = 10000) -> Dict[str, Any]:
-	        """
-	        Executa todos os 5 algoritmos e retorna um dicionário de resultados.
-	        """
-	        if len(candles) < 60:
-	            return {"error": "Insufficient data (need at least 60 candles)"}
+            # Retornar o dicionário da dataclass FullAnalysis
+            return dataclass_asdict(full_analysis)
 
-	        candles_dict = _convert_candles_to_dict(candles)
-	        
-	        # 1 & 2. Confluência
-	        long_setup = self.long_detector.detect_setup(candles_dict)
-	        short_setup = self.short_detector.detect_setup(candles_dict)
-	        
-	        # 3. Momentum
-	        momentum_signals = self.momentum_detector.analyze(candles_dict)
-	        
-	        # 4. Tendência
-	        trend_analysis = self.trend_detector.analyze(candles_dict)
-	        
-	        # 5. Score e Risco
-	        score_analysis = self.score_system.analyze(candles_dict, capital=capital)
+    # Helper para limpar Enums e converter dataclasses para dict
+    def _clean_dataclass_dict(data: Dict) -> Dict:
+        """Limpa os dicionários de dataclasses, convertendo Enums para strings."""
+        if isinstance(data, dict):
+            return {k: _clean_dataclass_dict(v) for k, v in data.items()}
+        elif isinstance(data, list):
+            return [_clean_dataclass_dict(v) for v in data]
+        elif hasattr(data, 'value'):
+            return data.value
+        return data
 
-	        # 6. Compilar resultados na estrutura FullAnalysis
-	        full_analysis = FullAnalysis(
-	            snapshot=candles[-1], # A última vela já tem todos os indicadores
-	            long_setup=_safe_asdict(long_setup),
-	            short_setup=_safe_asdict(short_setup),
-	            momentum_analysis=[_safe_asdict(s) for s in momentum_signals],
-	            trend_analysis=_safe_asdict(trend_analysis),
-	            score_analysis=_safe_asdict(score_analysis),
-	        )
-	        
-	        # Retornar o dicionário da dataclass FullAnalysis
-	        return dataclass_asdict(full_analysis)
+    def _safe_asdict(obj):
+        """Tenta usar dataclasses.asdict e limpa Enums. Usado para os resultados dos algoritmos."""
+        try:
+            data = dataclass_asdict(obj)
+            return _clean_dataclass_dict(data)
+        except TypeError:
+            # Se não for um dataclass, retorna o objeto
+            return obj
 
-	# Instanciar o analisador para uso no main.py
-	analyzer = ScalpingAnalyzer()
+    class ScalpingAnalyzer:
+        """
+        Classe principal para executar a análise de scalping integrada.
+        """
+        def __init__(self):
+            # Instanciar os detectores dos algoritmos originais
+            self.long_detector = ConfluenceLongDetector()
+            self.short_detector = ConfluenceShortDetector()
+            self.momentum_detector = MomentumDetector()
+            self.trend_detector = TrendDetector()
+            self.score_system = DynamicScoreSystem()
+
+        def get_full_analysis(self, candles: List[Candle], capital: float = 10000) -> Dict[str, Any]:
+            """
+            Executa todos os 5 algoritmos e retorna um dicionário de resultados.
+            """
+            if len(candles) < 60:
+                return {"error": "Insufficient data (need at least 60 candles)"}
+
+            candles_dict = _convert_candles_to_dict(candles)
+
+            # 1 & 2. Confluência
+            long_setup = self.long_detector.detect_setup(candles_dict)
+            short_setup = self.short_detector.detect_setup(candles_dict)
+
+            # 3. Momentum
+            momentum_signals = self.momentum_detector.analyze(candles_dict)
+
+            # 4. Tendência
+            trend_analysis = self.trend_detector.analyze(candles_dict)
+
+            # 5. Score e Risco
+            score_analysis = self.score_system.analyze(candles_dict, capital=capital)
+
+            # 6. Compilar resultados na estrutura FullAnalysis
+            full_analysis = FullAnalysis(
+                snapshot=candles[-1], # A última vela já tem todos os indicadores
+                long_setup=_safe_asdict(long_setup),
+                short_setup=_safe_asdict(short_setup),
+                momentum_analysis=[_safe_asdict(s) for s in momentum_signals],
+                trend_analysis=_safe_asdict(trend_analysis),
+                score_analysis=_safe_asdict(score_analysis),
+            )
+
+            # Retornar o dicionário da dataclass FullAnalysis
+            return dataclass_asdict(full_analysis)
+
+    # Instanciar o analisador para uso no main.py
+    analyzer = ScalpingAnalyzer()
