@@ -25,8 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 
 	# Importar modelos de dados compartilhados
 	from models import Candle, AnalysisSnapshot, Direction, FullAnalysis
-	# Importar o novo analisador de scalping
-	from scalping_analyzer import get_full_analysis as scalping_analyzer_func
+# Importar o novo analisador de scalping
+from scalping_analyzer import analyzer
 
 
 
@@ -1557,11 +1557,25 @@ def api_logs(
     rows = [r for r in engine.logs if int(r.get("ts_ms", 0)) >= cutoff]
     return {"logs": rows[-int(limit_i):], "hours": hours_f, "returned": min(len(rows), int(limit_i))}
 
-@app.get("/api/full_analysis")
+@app.get("/api/full_analysis", response_model=FullAnalysis)
 async def get_full_analysis(
     symbol: str = Query("BTCUSDT"),
-    interval: str = Query("3m"),
-    limit: int = Query(500),
+    interval: str = Query("1m"),
+    limit: int = Query(200),
+    capital: float = Query(10000.0),
+) -> FullAnalysis:
+    """Retorna a análise completa de scalping (5 algoritmos)"""
+    raw = await fetch_klines(symbol, interval, limit)
+    candles = parse_klines(raw)
+    
+    # Computar todos os indicadores
+    candles = compute_indicators(candles)
+    
+    # Executar a análise completa
+    analysis_dict = analyzer.get_full_analysis(candles, capital)
+    
+    # Converter o dicionário de volta para o modelo Pydantic/dataclass
+    return FullAnalysis(**analysis_dict)
     capital: float = Query(10000.0),
 ) -> dict[str, Any]:
     """
