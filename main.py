@@ -1509,22 +1509,5 @@ async def api_conditions(
         engine.log("CONDITIONS_ERROR", error=str(e))
         return {"ok": False, "error": str(e)}
 
-@app.get("/api/full_analysis")
-async def api_full_analysis(
-    symbol: str = Query("BTCUSDT"),
-    interval: str = Query("3m"),
-    limit: int = Query(500, ge=50, le=1000),
-    capital: float = Query(10000, gt=0)
-):
-    """Endpoint para executar a análise completa dos 5 algoritmos."""
-    try:
-        # Reutilizar a lógica de snapshot do engine
-        raw_klines = await fetch_klines(symbol, interval, limit)
-        candles = parse_klines(raw_klines)
-
-        # Executar a análise completa
-        analysis_result = scalping_analyzer.analyze_all(candles, capital)
-
-        return {"ok": True, **analysis_result}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+### REMOVIDO: havia um segundo endpoint duplicado com o mesmo path "/api/full_analysis"
+### que referenciava um nome não importado (scalping_analyzer) e podia gerar conflitos.
