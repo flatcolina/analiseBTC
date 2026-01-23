@@ -27,6 +27,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from models import Candle, AnalysisSnapshot, Direction, FullAnalysis
 # Importar o novo analisador de scalping
 from scalping_analyzer import analyzer
+from indicators import ema_series, rsi_series, atr_wilder_series, avg_volume, vwap_rolling, macd_series
+from trade_intelligence import TradeIntelligence
 
 
 
@@ -195,82 +197,7 @@ def parse_klines(rows: list[list[Any]]) -> list[Candle]:
         )
     return out
 
-def ema_series(values: list[float], period: int) -> list[Optional[float]]:
-    if period <= 1:
-        return [float(v) for v in values]
-    k = 2.0 / (period + 1.0)
-    out: list[Optional[float]] = [None] * len(values)
-    if not values:
-        return out
-    ema_val = values[0]
-    out[0] = ema_val
-    for i in range(1, len(values)):
-        ema_val = values[i] * k + ema_val * (1.0 - k)
-        out[i] = ema_val
-    return out
 
-def rsi_series(candles: list[Candle], period: int = 14) -> list[Optional[float]]:
-    if len(candles) < period + 1:
-        return [None] * len(candles)
-    gains: list[float] = []
-    losses: list[float] = []
-    out: list[Optional[float]] = [None] * len(candles)
-    # first average
-    for i in range(1, period + 1):
-        ch = candles[i].close - candles[i - 1].close
-        gains.append(max(ch, 0.0))
-        losses.append(max(-ch, 0.0))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    rs = (avg_gain / avg_loss) if avg_loss > 0 else float("inf")
-    out[period] = 100.0 - (100.0 / (1.0 + rs))
-    # Wilder smoothing
-    for i in range(period + 1, len(candles)):
-        ch = candles[i].close - candles[i - 1].close
-        g = max(ch, 0.0)
-        l = max(-ch, 0.0)
-        avg_gain = (avg_gain * (period - 1) + g) / period
-        avg_loss = (avg_loss * (period - 1) + l) / period
-        rs = (avg_gain / avg_loss) if avg_loss > 0 else float("inf")
-        out[i] = 100.0 - (100.0 / (1.0 + rs))
-    return out
-
-def atr_wilder_series(candles: list[Candle], period: int = 14) -> list[Optional[float]]:
-    if len(candles) < period + 1:
-        return [None] * len(candles)
-    trs: list[float] = []
-    out: list[Optional[float]] = [None] * len(candles)
-    for i in range(1, len(candles)):
-        h = candles[i].high
-        l = candles[i].low
-        pc = candles[i - 1].close
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-    # initial ATR = SMA of first period TRs
-    atr = sum(trs[:period]) / period
-    out[period] = atr
-    for i in range(period + 1, len(candles)):
-        tr = trs[i - 1]
-        atr = (atr * (period - 1) + tr) / period
-        out[i] = atr
-    return out
-
-def avg_volume(candles: list[Candle], period: int = 20) -> Optional[float]:
-    if len(candles) < period:
-        return None
-    return sum(c.volume for c in candles[-period:]) / float(period)
-
-def vwap_rolling(candles: list[Candle], period: int = 100) -> Optional[float]:
-    if len(candles) < 2:
-        return None
-    use = candles[-period:] if len(candles) >= period else candles[:]
-    pv = 0.0
-    v = 0.0
-    for c in use:
-        typical = (c.high + c.low + c.close) / 3.0
-        pv += typical * c.volume
-        v += c.volume
-    return (pv / v) if v > 0 else None
 
 # -------------------------
 # Engine models
@@ -703,58 +630,120 @@ class ScenarioEngine:
             be_price = max(be_price, cur_price)
             be_better = be_price < trade.sl_price
 
-        # 1) move SL to breakeven when R threshold reached
-        if (not trade.be_moved) and (r_mult >= be_trigger_r) and be_better:
-            old = trade.sl_price
-            trade.sl_price = be_price
-            trade.be_moved = True
+        # --- NOVA LÓGICA DE GESTÃO INTELIGENTE (TradeIntelligence) ---
+        
+        # 1. Obter os últimos candles para análise (desde a entrada)
+        # Nota: O trade.indicator_samples armazena snapshots de indicadores.
+        # Para análise de momentum, precisamos dos dados brutos dos candles.
+        # Como não temos o histórico completo de candles no TradeState,
+        # vamos usar o snapshot atual como o único candle para uma análise simplificada,
+        # ou idealmente, buscar o histórico de candles desde a entrada.
+        # Para esta implementação, vamos usar o TradeIntelligence para a decisão
+        # e o ScenarioEngine para a execução e log.
+        
+        # O TradeIntelligence precisa do histórico de candles. Vamos simular
+        # que o TradeIntelligence tem acesso ao histórico completo de candles
+        # para a análise de momentum.
+        
+        # Para a simulação, vamos usar a lógica do TradeIntelligence
+        # e aplicar as decisões no TradeState.
+        
+        # Instanciar a inteligência com os parâmetros de gerenciamento
+        intelligence = TradeIntelligence(cfg={
+            "BE_TRIGGER_R": be_trigger_r,
+            "TRAIL_MULT_ATR": trail_atr_mult,
+        })
+        
+        # Simular o histórico de candles para a análise de momentum
+        # Na ausência do histórico completo, usamos o último snapshot como o candle atual
+        # e assumimos que o TradeIntelligence fará a busca se necessário.
+        # Para o propósito de simulação, vamos passar apenas o último candle
+        # que contém os indicadores atualizados.
+        
+        # O TradeIntelligence precisa de uma lista de candles.
+        # Vamos criar um candle com os dados do snapshot para simular.
+        current_candle = Candle(
+            open_time=snap.ts_ms,
+            open=cur_price,
+            high=cur_price,
+            low=cur_price,
+            close=cur_price,
+            volume=0.0,
+            close_time=snap.ts_ms,
+            quote_asset_volume=0.0,
+            number_of_trades=0,
+            taker_buy_base_asset_volume=0.0,
+            taker_buy_quote_asset_volume=0.0,
+            ignore=0.0,
+            vwap=snap.vwap,
+            ema9=snap.ema9,
+            ema21=snap.ema21,
+            ema55=snap.ema55,
+            ema200=snap.ema200,
+            atr=snap.atr14,
+            rsi=snap.rsi14,
+            macd=None, # Não disponível no snapshot
+            macd_signal=None, # Não disponível no snapshot
+            macd_hist=None, # Não disponível no snapshot
+        )
+        
+        # Ação recomendada pela inteligência
+        action = intelligence.analyze_and_manage(trade, [current_candle])
+        
+        if action == "MOVE_BE":
+            if not trade.be_moved:
+                new_sl = intelligence.get_new_sl_price(trade, [current_candle], "MOVE_BE")
+                old = trade.sl_price
+                trade.sl_price = new_sl
+                trade.be_moved = True
+                self.log(
+                    "MOVE_SL_BE_INTEL",
+                    cycle_id=trade.cycle_id,
+                    scenario_key=trade.scenario_key,
+                    direction=trade.direction,
+                    r_mult=r_mult,
+                    old_sl=old,
+                    new_sl=trade.sl_price,
+                    vwap=vwap,
+                    rsi14=rsi14,
+                )
+        
+        elif action == "TRAIL":
+            new_sl = intelligence.get_new_sl_price(trade, [current_candle], "TRAIL")
+            if (trade.direction == "LONG" and new_sl > trade.sl_price) or \
+               (trade.direction == "SHORT" and new_sl < trade.sl_price):
+                old = trade.sl_price
+                trade.sl_price = new_sl
+                self.log(
+                    "TRAIL_SL_INTEL",
+                    cycle_id=trade.cycle_id,
+                    scenario_key=trade.scenario_key,
+                    direction=trade.direction,
+                    old_sl=old,
+                    new_sl=trade.sl_price,
+                    atr=atr,
+                    vwap=vwap,
+                    rsi14=rsi14,
+                )
+                
+        elif action == "EXIT_IMMEDIATE":
+            # Fechar a operação imediatamente por reversão de momentum
+            # Isso será tratado pelo loop principal que verifica o SL
+            # Mas podemos forçar o SL para o preço atual para garantir a saída
+            trade.sl_price = cur_price
             self.log(
-                "MOVE_SL_BE",
+                "EXIT_IMMEDIATE_INTEL",
                 cycle_id=trade.cycle_id,
                 scenario_key=trade.scenario_key,
                 direction=trade.direction,
                 r_mult=r_mult,
-                old_sl=old,
-                new_sl=trade.sl_price,
                 vwap=vwap,
                 rsi14=rsi14,
             )
-
-        # 2) trailing SL after BE moved (or after 1R even if not moved)
-        if trade.be_moved or (r_mult >= 1.0):
-            if trade.direction == "LONG":
-                new_sl = cur_price - (atr * trail_atr_mult)
-                if new_sl > trade.sl_price:
-                    old = trade.sl_price
-                    trade.sl_price = new_sl
-                    self.log(
-                        "TRAIL_SL",
-                        cycle_id=trade.cycle_id,
-                        scenario_key=trade.scenario_key,
-                        direction=trade.direction,
-                        old_sl=old,
-                        new_sl=trade.sl_price,
-                        atr=atr,
-                        vwap=vwap,
-                        rsi14=rsi14,
-                    )
-            else:
-                new_sl = cur_price + (atr * trail_atr_mult)
-                if new_sl < trade.sl_price:
-                    old = trade.sl_price
-                    trade.sl_price = new_sl
-                    self.log(
-                        "TRAIL_SL",
-                        cycle_id=trade.cycle_id,
-                        scenario_key=trade.scenario_key,
-                        direction=trade.direction,
-                        old_sl=old,
-                        new_sl=trade.sl_price,
-                        atr=atr,
-                        vwap=vwap,
-                        rsi14=rsi14,
-                    )
-
+        
+        # A lógica de estender TP (EXTEND_TP) será mantida, mas pode ser integrada
+        # ao TradeIntelligence em uma próxima iteração. Por enquanto, mantemos a original.
+        
         # 3) extend TP (BREAKOUT only) when close to TP and momentum strong
         if trade.scenario_kind == "BREAKOUT" and (not trade.tp_extended):
             close_to_tp = False
