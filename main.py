@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from typing import Any, Literal, Optional
 
 import httpx
@@ -231,6 +231,21 @@ class TradeState:
     tp_extended: bool = False
     last_manage_ms: int = 0
     last_price: float = 0.0
+
+    # --- diagnostics for analysis / future improvements ---
+    best_fav_price: float = 0.0           # best favorable price seen during the trade
+    worst_adv_price: float = 0.0          # worst adverse price seen during the trade
+    closest_tp_price: float = 0.0         # price at the moment we were closest to TP
+    closest_tp_dist: float = 0.0          # absolute distance to TP at that moment
+    closest_tp_ts_ms: int = 0             # timestamp (ms) when closest to TP happened
+    closest_sl_price: float = 0.0         # price at the moment we were closest to SL
+    closest_sl_dist: float = 0.0          # absolute distance to SL at that moment
+    closest_sl_ts_ms: int = 0             # timestamp (ms) when closest to SL happened
+    mfe_gross_usd: float = 0.0            # maximum unrealized PnL (gross) during trade
+    mae_gross_usd: float = 0.0            # minimum unrealized PnL (gross) during trade (usually negative)
+    entry_indicators: dict = field(default_factory=dict)      # indicators at entry (for pattern mining)
+    indicator_samples: list = field(default_factory=list)     # rolling indicator snapshots during the trade
+
 
 @dataclass
 class ScenarioTotals:
@@ -561,6 +576,75 @@ class ScenarioEngine:
     def _scenario_ok(self, sc: ScenarioDef) -> bool:
         return all(c.ok for c in sc.conditions)
 
+    def _update_trade_diagnostics(self, trade: TradeState, snap: AnalysisSnapshot):
+        """Update MFE/MAE, closest-to-TP/SL, and store indicator samples."""
+        try:
+            price = float(snap.price or 0.0)
+            if price <= 0:
+                return
+
+            # initialize anchors
+            if trade.best_fav_price <= 0:
+                trade.best_fav_price = price
+            if trade.worst_adv_price <= 0:
+                trade.worst_adv_price = price
+
+            # favorable/adverse extremes (direction-aware)
+            if trade.direction == "LONG":
+                trade.best_fav_price = max(trade.best_fav_price, price)
+                trade.worst_adv_price = min(trade.worst_adv_price, price)
+                unreal = (price - trade.entry_exec) * trade.qty_btc
+            else:  # SHORT
+                trade.best_fav_price = min(trade.best_fav_price, price)
+                trade.worst_adv_price = max(trade.worst_adv_price, price)
+                unreal = (trade.entry_exec - price) * trade.qty_btc
+
+            trade.mfe_gross_usd = max(trade.mfe_gross_usd, unreal)
+            trade.mae_gross_usd = min(trade.mae_gross_usd, unreal)
+
+            # closest points to TP / SL (using current TP/SL levels, since they can move)
+            tp = float(trade.tp_price or 0.0)
+            sl = float(trade.sl_price or 0.0)
+            ts_ms = int(snap.ts_ms or 0)
+
+            if tp > 0:
+                dist_tp = abs(tp - price)
+                if trade.closest_tp_dist <= 0 or dist_tp < trade.closest_tp_dist:
+                    trade.closest_tp_dist = dist_tp
+                    trade.closest_tp_price = price
+                    trade.closest_tp_ts_ms = ts_ms
+
+            if sl > 0:
+                dist_sl = abs(price - sl)
+                if trade.closest_sl_dist <= 0 or dist_sl < trade.closest_sl_dist:
+                    trade.closest_sl_dist = dist_sl
+                    trade.closest_sl_price = price
+                    trade.closest_sl_ts_ms = ts_ms
+
+            # store indicator state (compact)
+            trade.indicator_samples.append({
+                "ts_ms": ts_ms,
+                "ts": ms_to_iso(ts_ms),
+                "price": price,
+                "vwap": snap.vwap,
+                "ema200": snap.ema200,
+                "rsi14": snap.rsi14,
+                "atr14": snap.atr14,
+                "avg_vol20": snap.avg_vol20,
+                "recent_high": snap.recent_high,
+                "recent_low": snap.recent_low,
+                "tp": tp,
+                "sl": sl,
+            })
+
+            # avoid unbounded memory if something runs for very long
+            if len(trade.indicator_samples) > 2000:
+                trade.indicator_samples = trade.indicator_samples[-2000:]
+        except Exception:
+            return
+
+
+
     async def _manage_trade(
         self,
         trade: TradeState,
@@ -592,6 +676,7 @@ class ScenarioEngine:
         self.last_snapshot = snap
         cur_price = snap.price
         trade.last_price = cur_price
+        self._update_trade_diagnostics(trade, snap)
         atr = snap.atr14 or trade.atr_at_entry
         vwap = snap.vwap
         rsi14 = snap.rsi14
@@ -858,6 +943,18 @@ class ScenarioEngine:
             "direction": trade.direction,
             "entry_exec": trade.entry_exec,
             "entry_raw": trade.entry_raw,
+            'best_fav_price': trade.best_fav_price,
+            'worst_adv_price': trade.worst_adv_price,
+            'closest_tp_price': trade.closest_tp_price,
+            'closest_tp_dist': trade.closest_tp_dist,
+            'closest_tp_ts': ms_to_iso(trade.closest_tp_ts_ms) if trade.closest_tp_ts_ms else None,
+            'closest_sl_price': trade.closest_sl_price,
+            'closest_sl_dist': trade.closest_sl_dist,
+            'closest_sl_ts': ms_to_iso(trade.closest_sl_ts_ms) if trade.closest_sl_ts_ms else None,
+            'mfe_gross_usd': trade.mfe_gross_usd,
+            'mae_gross_usd': trade.mae_gross_usd,
+            'entry_indicators': trade.entry_indicators,
+            'indicator_samples': trade.indicator_samples,
         }
 
         self.log("TRADE_END", cycle_id=trade.cycle_id, **info)
@@ -1009,6 +1106,28 @@ class ScenarioEngine:
                 atr_at_entry=atr_val,
                 last_price=raw_price,
             )
+            # initialize diagnostics and store indicators at entry
+            trade.best_fav_price = raw_price
+            trade.worst_adv_price = raw_price
+            trade.closest_tp_price = raw_price
+            trade.closest_tp_dist = abs(trade.tp_price - raw_price) if trade.tp_price else 0.0
+            trade.closest_tp_ts_ms = snap.ts_ms
+            trade.closest_sl_price = raw_price
+            trade.closest_sl_dist = abs(raw_price - trade.sl_price) if trade.sl_price else 0.0
+            trade.closest_sl_ts_ms = snap.ts_ms
+            trade.entry_indicators = {
+                'ts_ms': snap.ts_ms,
+                'ts': ms_to_iso(snap.ts_ms),
+                'price': raw_price,
+                'vwap': snap.vwap,
+                'ema200': snap.ema200,
+                'rsi14': snap.rsi14,
+                'atr14': snap.atr14,
+                'avg_vol20': snap.avg_vol20,
+                'recent_high': snap.recent_high,
+                'recent_low': snap.recent_low,
+            }
+            trade.indicator_samples = [dict(trade.entry_indicators, tp=trade.tp_price, sl=trade.sl_price)]
 
             self.log(
                 "ENTER",
@@ -1198,10 +1317,10 @@ def api_status():
 
 @app.get("/api/logs")
 def api_logs(
-    hours: int = Query(12, ge=1, le=72),
+    hours: float = Query(12.0, ge=0.1, le=72.0),
     limit: int = Query(20000, ge=1, le=60000),
 ):
-    cutoff = now_ms() - hours * 3600_000
+    cutoff = now_ms() - int(hours * 3600_000)
     rows = [r for r in engine.logs if int(r.get("ts_ms", 0)) >= cutoff]
     return {"logs": rows[-int(limit):], "hours": hours, "returned": min(len(rows), int(limit))}
 
