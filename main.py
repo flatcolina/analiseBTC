@@ -23,8 +23,8 @@ import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-	# Importar modelos de dados compartilhados
-	from models import Candle, AnalysisSnapshot, Direction, FullAnalysis
+# Importar modelos de dados compartilhados
+from models import Candle, AnalysisSnapshot, Direction, FullAnalysis
 # Importar o novo analisador de scalping
 from scalping_analyzer import analyzer
 
