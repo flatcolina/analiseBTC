@@ -23,7 +23,40 @@ import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
-Direction = Literal["LONG", "SHORT"]
+	# Importar modelos de dados compartilhados
+	from models import Candle, AnalysisSnapshot, Direction, FullAnalysis
+	# Importar o novo analisador de scalping
+	from scalping_analyzer import get_full_analysis as scalping_analyzer_func
+
+
+
+def _parse_float(v: Any, default: float) -> float:
+    try:
+        if v is None:
+            return float(default)
+        if isinstance(v, (int, float)):
+            return float(v)
+        s = str(v).strip().replace(",", ".")
+        if s == "":
+            return float(default)
+        return float(s)
+    except Exception:
+        return float(default)
+
+def _parse_int(v: Any, default: int) -> int:
+    try:
+        if v is None:
+            return int(default)
+        if isinstance(v, bool):
+            return int(default)
+        if isinstance(v, int):
+            return int(v)
+        s = str(v).strip()
+        if s == "":
+            return int(default)
+        return int(float(s))
+    except Exception:
+        return int(default)
 
 # -------------------------
 # Helpers
@@ -69,19 +102,76 @@ async def fetch_price(symbol: str) -> float:
         data = r.json()
         return float(data["price"])
 
-# -------------------------
+## -------------------------
 # Indicators
 # -------------------------
 
-@dataclass
-class Candle:
-    open_time_ms: int
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
-    close_time_ms: int
+def macd_series(closes: list[float], fast_period: int = 12, slow_period: int = 26, signal_period: int = 9) -> tuple[list[Optional[float]], list[Optional[float]], list[Optional[float]]]:
+    """Calcula MACD, Linha de Sinal e Histograma."""
+    ema_fast = ema_series(closes, fast_period)
+    ema_slow = ema_series(closes, slow_period)
+    
+    macd_line: list[Optional[float]] = [None] * len(closes)
+    for i in range(len(closes)):
+        if ema_fast[i] is not None and ema_slow[i] is not None:
+            macd_line[i] = ema_fast[i] - ema_slow[i]
+    
+    # Calcular a linha de sinal (EMA da linha MACD)
+    macd_values = [v for v in macd_line if v is not None]
+    signal_line_raw = ema_series(macd_values, signal_period)
+    
+    # Mapear a linha de sinal de volta para o tamanho original
+    signal_line: list[Optional[float]] = [None] * len(closes)
+    j = 0
+    for i in range(len(closes)):
+        if macd_line[i] is not None:
+            if j < len(signal_line_raw):
+                signal_line[i] = signal_line_raw[j]
+                j += 1
+    
+    # Calcular o histograma
+    histogram: list[Optional[float]] = [None] * len(closes)
+    for i in range(len(closes)):
+        if macd_line[i] is not None and signal_line[i] is not None:
+            histogram[i] = macd_line[i] - signal_line[i]
+            
+    return macd_line, signal_line, histogram
+
+def compute_indicators(candles: list[Candle]) -> list[Candle]:
+    """Calcula e atribui todos os indicadores necessários aos objetos Candle."""
+    closes = [c.close for c in candles]
+    
+    # EMAs (9, 21, 55, 200)
+    ema9s = ema_series(closes, 9)
+    ema21s = ema_series(closes, 21)
+    ema55s = ema_series(closes, 55)
+    ema200s = ema_series(closes, 200)
+    
+    # RSI
+    rsis = rsi_series(candles, 14)
+    
+    # ATR
+    atrs = atr_wilder_series(candles, 14)
+    
+    # VWAP (Rolling 100)
+    vwaps = [vwap_rolling(candles[:i+1], 100) for i in range(len(candles))]
+    
+    # MACD
+    macd_line, signal_line, histogram = macd_series(closes)
+    
+    for i, c in enumerate(candles):
+        c.ema9 = ema9s[i]
+        c.ema21 = ema21s[i]
+        c.ema55 = ema55s[i]
+        c.ema200 = ema200s[i]
+        c.rsi = rsis[i]
+        c.atr = atrs[i]
+        c.vwap = vwaps[i]
+        c.macd = macd_line[i]
+        c.macd_signal = signal_line[i]
+        c.macd_hist = histogram[i]
+        
+    return candles
 
 def parse_klines(rows: list[list[Any]]) -> list[Candle]:
     out: list[Candle] = []
@@ -181,19 +271,7 @@ def vwap_rolling(candles: list[Candle], period: int = 100) -> Optional[float]:
 # Engine models
 # -------------------------
 
-@dataclass
-class AnalysisSnapshot:
-    ts_ms: int
-    symbol: str
-    interval: str
-    price: float
-    vwap: Optional[float]
-    ema200: Optional[float]
-    rsi14: Optional[float]
-    atr14: Optional[float]
-    avg_vol20: Optional[float]
-    recent_high: Optional[float]
-    recent_low: Optional[float]
+
 
 @dataclass
 class ScenarioCondition:
@@ -306,62 +384,62 @@ class ScenarioEngine:
         self.cycle_id: int = 0
         self.cfg: dict[str, Any] = {}
 
-        self.retention_ms: int = int(os.getenv("LOG_RETENTION_HOURS", "12")) * 3600_000
-
-    def _prune_logs(self) -> None:
-        if not self.logs:
-            return
-        cutoff = now_ms() - self.retention_ms
-        # prune from front
-        i = 0
-        while i < len(self.logs) and int(self.logs[i].get("ts_ms", 0)) < cutoff:
-            i += 1
-        if i > 0:
-            self.logs = self.logs[i:]
-
-        # extra safety cap
-        cap = int(os.getenv("LOG_MAX_ROWS", "60000"))
-        if len(self.logs) > cap:
-            self.logs = self.logs[-cap:]
-
-    def log(self, event: str, **data: Any) -> None:
-        ts = now_ms()
-        row = {"ts_ms": ts, "ts": ms_to_iso(ts), "event": event, **data}
-        self.logs.append(row)
-        self._prune_logs()
-
-    async def _snapshot(self, symbol: str, interval: str, limit: int) -> tuple[list[Candle], AnalysisSnapshot]:
-        raw = await fetch_klines(symbol, interval, limit)
-        candles = parse_klines(raw)
-        if not candles:
-            raise RuntimeError("No candles returned")
-        price = candles[-1].close
-        closes = [c.close for c in candles]
-        ema200s = ema_series(closes, 200)
-        rsi14s = rsi_series(candles, 14)
-        atr14s = atr_wilder_series(candles, 14)
-        vwap = vwap_rolling(candles, 100)
-        avgv = avg_volume(candles, 20)
-
-        lookback = 20
-        recent = candles[-lookback:] if len(candles) >= lookback else candles
-        rh = max(c.high for c in recent) if recent else None
-        rl = min(c.low for c in recent) if recent else None
-
-        snap = AnalysisSnapshot(
-            ts_ms=now_ms(),
-            symbol=symbol,
-            interval=interval,
-            price=float(price),
-            vwap=float(vwap) if vwap is not None else None,
-            ema200=float(ema200s[-1]) if ema200s and ema200s[-1] is not None else None,
-            rsi14=float(rsi14s[-1]) if rsi14s and rsi14s[-1] is not None else None,
-            atr14=float(atr14s[-1]) if atr14s and atr14s[-1] is not None else None,
-            avg_vol20=float(avgv) if avgv is not None else None,
-            recent_high=float(rh) if rh is not None else None,
-            recent_low=float(rl) if rl is not None else None,
-        )
-        return candles, snap
+	        self.retention_ms: int = int(os.getenv("LOG_RETENTION_HOURS", "12")) * 3600_000
+	
+	    def _prune_logs(self) -> None:
+	        if not self.logs:
+	            return
+	        cutoff = now_ms() - self.retention_ms
+	        # prune from front
+	        i = 0
+	        while i < len(self.logs) and int(self.logs[i].get("ts_ms", 0)) < cutoff:
+	            i += 1
+	        if i > 0:
+	            self.logs = self.logs[i:]
+	
+	        # extra safety cap
+	        cap = int(os.getenv("LOG_MAX_ROWS", "60000"))
+	        if len(self.logs) > cap:
+	            self.logs = self.logs[-cap:]
+	
+	    def log(self, event: str, **data: Any) -> None:
+	        ts = now_ms()
+	        row = {"ts_ms": ts, "ts": ms_to_iso(ts), "event": event, **data}
+	        self.logs.append(row)
+	        self._prune_logs()
+	
+	    async def _snapshot(self, symbol: str, interval: str, limit: int) -> tuple[list[Candle], AnalysisSnapshot]:
+	        raw = await fetch_klines(symbol, interval, limit)
+	        candles = parse_klines(raw)
+	        if not candles:
+	            raise RuntimeError("No candles returned")
+	        
+	        # Compute all indicators for the full list of candles
+	        candles = compute_indicators(candles)
+	        
+	        price = candles[-1].close
+	        
+	        # The original snapshot only needs a few indicators for the old scenarios
+	        avg_vol = avg_volume(candles, 20)
+	        lookback = 20
+	        recent = candles[-lookback:] if len(candles) >= lookback else candles
+	        rh = max(c.high for c in recent) if recent else None
+	        rl = min(c.low for c in recent) if recent else None
+	        
+	        snap = AnalysisSnapshot(
+	            ts_ms=now_ms(),
+	            symbol=symbol,
+	            interval=interval,
+	            price=float(price),
+	            vwap=float(candles[-1].vwap) if candles[-1].vwap is not None else None,
+	            ema200=float(candles[-1].ema200) if candles[-1].ema200 is not None else None,
+	            rsi14=float(candles[-1].rsi) if candles[-1].rsi is not None else None,
+	            atr14=float(candles[-1].atr) if candles[-1].atr is not None else None,
+	            avg_vol20=avg_vol,
+	            recent_high=rh,
+	            recent_low=rl,
+	        )
+	        return candles, snap
 
     def _build_scenarios(
         self,
@@ -926,8 +1004,24 @@ class ScenarioEngine:
             self.by_kind[trade.scenario_kind].net_time_usd += net
             self.by_key[trade.scenario_key].net_time_usd += net
 
+        risk_per_btc = abs(trade.entry_exec - trade.sl_price) if (trade.entry_exec is not None and trade.sl_price is not None) else None
+        risk_usd = (risk_per_btc * trade.qty_btc) if (risk_per_btc is not None and trade.qty_btc is not None) else None
+        mfe_r = (trade.mfe_gross_usd / risk_usd) if (risk_usd not in (None, 0)) else None
+        mae_r = (trade.mae_gross_usd / risk_usd) if (risk_usd not in (None, 0)) else None
+        closest_tp_r = (trade.closest_tp_dist / risk_per_btc) if (risk_per_btc not in (None, 0) and trade.closest_tp_dist is not None) else None
+        closest_sl_r = (trade.closest_sl_dist / risk_per_btc) if (risk_per_btc not in (None, 0) and trade.closest_sl_dist is not None) else None
+
         info = {
             "outcome": outcome,
+            "scenario_kind": trade.scenario_kind,
+            "scenario_key": trade.scenario_key,
+            "direction": trade.direction,
+            "entry_price_exec": trade.entry_exec,
+            "risk_usd": risk_usd,
+            "mfe_r": mfe_r,
+            "mae_r": mae_r,
+            "closest_tp_r": closest_tp_r,
+            "closest_sl_r": closest_sl_r,
             "exit_time_ms": t_ms,
             "exit_time": ms_to_iso(t_ms),
             "exit_price_raw": exit_raw,
@@ -1300,6 +1394,133 @@ def api_reset():
     engine.reset()
     return {"ok": True}
 
+@app.get("/api/diagnostics")
+def api_diagnostics(
+    hours: str = Query("12"),
+    limit: str = Query("20000"),
+):
+    hours_f = _parse_float(hours, 12.0)
+    if hours_f < 0.1:
+        hours_f = 0.1
+    if hours_f > 72.0:
+        hours_f = 72.0
+
+    limit_i = _parse_int(limit, 20000)
+    if limit_i < 1:
+        limit_i = 1
+    if limit_i > 60000:
+        limit_i = 60000
+
+    cutoff = now_ms() - int(hours_f * 3600_000)
+    rows = [r for r in engine.logs if int(r.get("ts_ms", 0)) >= cutoff]
+    ends = [r for r in rows if r.get("event") == "TRADE_END"]
+    if len(ends) > limit_i:
+        ends = ends[-limit_i:]
+
+    def _bucket_rsi(rsi: Any) -> str:
+        v = _parse_float(rsi, float("nan"))
+        if v != v:
+            return "RSI:na"
+        if v < 40:
+            return "RSI:<40"
+        if v <= 60:
+            return "RSI:40-60"
+        return "RSI:>60"
+
+    def _side(price: Any, ref: Any, label: str) -> str:
+        p = _parse_float(price, float("nan"))
+        r = _parse_float(ref, float("nan"))
+        if p != p or r != r:
+            return f"{label}:na"
+        return f"{label}:{'above' if p >= r else 'below'}"
+
+    per_kind: Dict[str, Dict[str, Any]] = {}
+    per_scenario: Dict[str, Dict[str, Any]] = {}
+
+    pullback_sl_patterns: Dict[str, int] = {}
+    pullback_sl: List[Dict[str, Any]] = []
+    pullback_all: List[Dict[str, Any]] = []
+
+    def _agg(dct: Dict[str, Dict[str, Any]], name: str, outcome: str, net: float) -> None:
+        if name not in dct:
+            dct[name] = {"trades": 0, "tp": 0, "sl": 0, "time": 0, "net_usd": 0.0}
+        dct[name]["trades"] += 1
+        if outcome == "TP":
+            dct[name]["tp"] += 1
+        elif outcome == "SL":
+            dct[name]["sl"] += 1
+        elif outcome == "TIME":
+            dct[name]["time"] += 1
+        dct[name]["net_usd"] += net
+
+    for row in ends:
+        payload = row.get("payload") or {}
+        kind = payload.get("scenario_kind") or payload.get("kind") or "unknown"
+        scen = payload.get("scenario_key") or payload.get("scenario") or "unknown"
+        outcome = payload.get("outcome") or "UNKNOWN"
+        net = _parse_float(payload.get("net_usd"), 0.0)
+
+        _agg(per_kind, str(kind), str(outcome), float(net))
+        _agg(per_scenario, str(scen), str(outcome), float(net))
+
+        if str(kind).lower().startswith("pullback"):
+            pullback_all.append(payload)
+            if str(outcome) == "SL":
+                pullback_sl.append(payload)
+                ind = payload.get("entry_indicators") or {}
+                pattern = " | ".join([
+                    _side(ind.get("price"), ind.get("vwap"), "VWAP"),
+                    _side(ind.get("price"), ind.get("ema200"), "EMA200"),
+                    _bucket_rsi(ind.get("rsi14")),
+                ])
+                pullback_sl_patterns[pattern] = pullback_sl_patterns.get(pattern, 0) + 1
+
+    def _avg(items: List[Dict[str, Any]], key: str) -> Optional[float]:
+        vals: List[float] = []
+        for it in items:
+            v = _parse_float(it.get(key), float("nan"))
+            if v == v:
+                vals.append(float(v))
+        return (sum(vals) / len(vals)) if vals else None
+
+    def _pct(items: List[Dict[str, Any]], pred) -> Optional[float]:
+        if not items:
+            return None
+        ok = 0
+        for it in items:
+            if pred(it):
+                ok += 1
+        return ok / len(items)
+
+    def _get_r(it: Dict[str, Any], key: str) -> float:
+        return _parse_float(it.get(key), float("nan"))
+
+    pullback_diag = {
+        "trades": len(pullback_all),
+        "sl": len(pullback_sl),
+        "tp": sum(1 for it in pullback_all if str(it.get("outcome")) == "TP"),
+        "time": sum(1 for it in pullback_all if str(it.get("outcome")) == "TIME"),
+        "net_usd": sum(_parse_float(it.get("net_usd"), 0.0) for it in pullback_all),
+        "avg_mfe_r_on_sl": _avg(pullback_sl, "mfe_r"),
+        "avg_mae_r_on_sl": _avg(pullback_sl, "mae_r"),
+        "avg_closest_tp_r_on_sl": _avg(pullback_sl, "closest_tp_r"),
+        "pct_sl_after_0_5r": _pct(pullback_sl, lambda it: _get_r(it, "mfe_r") >= 0.5),
+        "pct_sl_after_0_8r": _pct(pullback_sl, lambda it: _get_r(it, "mfe_r") >= 0.8),
+        "pct_sl_near_tp": _pct(pullback_sl, lambda it: _get_r(it, "closest_tp_r") <= 0.2),
+        "top_sl_patterns": [
+            {"pattern": p, "count": c}
+            for p, c in sorted(pullback_sl_patterns.items(), key=lambda kv: kv[1], reverse=True)[:8]
+        ],
+    }
+
+    return {
+        "hours": hours_f,
+        "returned": len(ends),
+        "by_kind": per_kind,
+        "by_scenario": per_scenario,
+        "pullback_diag": pullback_diag,
+    }
+
 @app.get("/api/status")
 def api_status():
     return {
@@ -1317,12 +1538,53 @@ def api_status():
 
 @app.get("/api/logs")
 def api_logs(
-    hours: float = Query(12.0, ge=0.1, le=72.0),
-    limit: int = Query(20000, ge=1, le=60000),
+    hours: str = Query("12"),
+    limit: str = Query("20000"),
 ):
-    cutoff = now_ms() - int(hours * 3600_000)
+    hours_f = _parse_float(hours, 12.0)
+    if hours_f < 0.1:
+        hours_f = 0.1
+    if hours_f > 72.0:
+        hours_f = 72.0
+
+    limit_i = _parse_int(limit, 20000)
+    if limit_i < 1:
+        limit_i = 1
+    if limit_i > 60000:
+        limit_i = 60000
+
+    cutoff = now_ms() - int(hours_f * 3600_000)
     rows = [r for r in engine.logs if int(r.get("ts_ms", 0)) >= cutoff]
-    return {"logs": rows[-int(limit):], "hours": hours, "returned": min(len(rows), int(limit))}
+    return {"logs": rows[-int(limit_i):], "hours": hours_f, "returned": min(len(rows), int(limit_i))}
+
+@app.get("/api/full_analysis")
+async def get_full_analysis(
+    symbol: str = Query("BTCUSDT"),
+    interval: str = Query("3m"),
+    limit: int = Query(500),
+    capital: float = Query(10000.0),
+) -> dict[str, Any]:
+    """
+    Retorna a análise completa dos 5 algoritmos de scalping.
+    """
+    try:
+        klines = await fetch_klines(symbol, interval, limit)
+        candles = parse_klines(klines)
+        candles = compute_indicators(candles)
+        
+        # Apenas a última vela é necessária para a análise
+        if not candles:
+            return {"error": "No market data available"}
+
+        # Executa a análise completa
+        analysis_result = scalping_analyzer.get_full_analysis(candles, capital)
+        
+        # Converte o resultado da dataclass para dict
+        return asdict(analysis_result)
+
+    except Exception as e:
+        print(f"Error in get_full_analysis: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/conditions")
 async def api_conditions(
@@ -1344,4 +1606,24 @@ async def api_conditions(
         }
     except Exception as e:
         engine.log("CONDITIONS_ERROR", error=str(e))
+        return {"ok": False, "error": str(e)}
+
+@app.get("/api/full_analysis")
+async def api_full_analysis(
+    symbol: str = Query("BTCUSDT"),
+    interval: str = Query("3m"),
+    limit: int = Query(500, ge=50, le=1000),
+    capital: float = Query(10000, gt=0)
+):
+    """Endpoint para executar a análise completa dos 5 algoritmos."""
+    try:
+        # Reutilizar a lógica de snapshot do engine
+        raw_klines = await fetch_klines(symbol, interval, limit)
+        candles = parse_klines(raw_klines)
+        
+        # Executar a análise completa
+        analysis_result = scalping_analyzer.analyze_all(candles, capital)
+        
+        return {"ok": True, **analysis_result}
+    except Exception as e:
         return {"ok": False, "error": str(e)}
