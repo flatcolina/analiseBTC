@@ -3,6 +3,29 @@ from typing import List, Optional, Dict, Any, Literal
 
 Direction = Literal["LONG", "SHORT"]
 
+
+@dataclass
+class AnalysisSnapshot:
+    """Snapshot leve usado pelos cenários/monitoramento do backend.
+
+    Este snapshot é menor que `Candle` e contém somente os campos que o motor
+    de cenários (pullback/breakout) e os endpoints antigos precisam.
+    """
+
+    ts_ms: int
+    symbol: str
+    interval: str
+    price: float
+
+    vwap: Optional[float] = None
+    ema200: Optional[float] = None
+    rsi14: Optional[float] = None
+    atr14: Optional[float] = None
+
+    avg_vol20: Optional[float] = None
+    recent_high: Optional[float] = None
+    recent_low: Optional[float] = None
+
 @dataclass
 class Candle:
     """Representa um candle de preço com indicadores técnicos."""
