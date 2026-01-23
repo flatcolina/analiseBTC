@@ -179,13 +179,18 @@ def parse_klines(rows: list[list[Any]]) -> list[Candle]:
         # Binance kline schema
         out.append(
             Candle(
-                open_time_ms=int(r[0]),
+                open_time=int(r[0]),
                 open=float(r[1]),
                 high=float(r[2]),
                 low=float(r[3]),
                 close=float(r[4]),
                 volume=float(r[5]),
-                close_time_ms=int(r[6]),
+                close_time=int(r[6]),
+                quote_asset_volume=float(r[7]),
+                number_of_trades=int(r[8]),
+                taker_buy_base_asset_volume=float(r[9]),
+                taker_buy_quote_asset_volume=float(r[10]),
+                ignore=float(r[11]),
             )
         )
     return out
@@ -273,91 +278,7 @@ def vwap_rolling(candles: list[Candle], period: int = 100) -> Optional[float]:
 
 
 
-@dataclass
-class ScenarioCondition:
-    label: str
-    current: Optional[float]
-    target: Optional[float]
-    ok: bool
-    extra: dict[str, Any] | None = None
 
-@dataclass
-class ScenarioDef:
-    key: str
-    name: str
-    direction: Direction
-    kind: Literal["PULLBACK", "BREAKOUT"]
-    conditions: list[ScenarioCondition]
-    # keep computed reference values to show in UI
-    refs: dict[str, Any]
-
-@dataclass
-class TradeState:
-    cycle_id: int
-    scenario_key: str
-    scenario_kind: Literal["PULLBACK", "BREAKOUT"]
-    direction: Direction
-    entry_time_ms: int
-    entry_raw: float
-    entry_exec: float
-    qty_btc: float
-    tp_price: float
-    sl_price: float
-    atr_at_entry: float
-    be_armed: bool = False
-    be_moved: bool = False
-    tp_extended: bool = False
-    last_manage_ms: int = 0
-    last_price: float = 0.0
-
-    # --- diagnostics for analysis / future improvements ---
-    best_fav_price: float = 0.0           # best favorable price seen during the trade
-    worst_adv_price: float = 0.0          # worst adverse price seen during the trade
-    closest_tp_price: float = 0.0         # price at the moment we were closest to TP
-    closest_tp_dist: float = 0.0          # absolute distance to TP at that moment
-    closest_tp_ts_ms: int = 0             # timestamp (ms) when closest to TP happened
-    closest_sl_price: float = 0.0         # price at the moment we were closest to SL
-    closest_sl_dist: float = 0.0          # absolute distance to SL at that moment
-    closest_sl_ts_ms: int = 0             # timestamp (ms) when closest to SL happened
-    mfe_gross_usd: float = 0.0            # maximum unrealized PnL (gross) during trade
-    mae_gross_usd: float = 0.0            # minimum unrealized PnL (gross) during trade (usually negative)
-    entry_indicators: dict = field(default_factory=dict)      # indicators at entry (for pattern mining)
-    indicator_samples: list = field(default_factory=list)     # rolling indicator snapshots during the trade
-
-
-@dataclass
-class ScenarioTotals:
-    trades: int = 0
-    tp: int = 0
-    sl: int = 0
-    time: int = 0
-
-    gross_pnl_usd: float = 0.0
-    fees_usd: float = 0.0
-    net_pnl_usd: float = 0.0
-
-    # net PnL split by outcome
-    net_tp_usd: float = 0.0
-    net_sl_usd: float = 0.0
-    net_time_usd: float = 0.0
-
-@dataclass
-class EngineStats:
-    cycles_total: int = 0
-    no_entry: int = 0
-    trades_total: int = 0
-    tp: int = 0
-    sl: int = 0
-    time: int = 0
-
-    gross_pnl_usd: float = 0.0
-    fees_usd: float = 0.0
-    net_pnl_usd: float = 0.0
-
-    # net PnL split by outcome
-    net_tp_usd: float = 0.0
-    net_sl_usd: float = 0.0
-    net_time_usd: float = 0.0
 
 # -------------------------
 # Scenario engine
