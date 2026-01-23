@@ -24,7 +24,7 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 # Importar modelos de dados compartilhados
-from models import Candle, AnalysisSnapshot, Direction, FullAnalysis
+from models import Candle, AnalysisSnapshot, Direction, FullAnalysis, TradeState
 # Importar o novo analisador de scalping
 from scalping_analyzer import analyzer
 from indicators import ema_series, rsi_series, atr_wilder_series, avg_volume, vwap_rolling, macd_series
@@ -201,6 +201,74 @@ def parse_klines(rows: list[list[Any]]) -> list[Candle]:
 
 # -------------------------
 # Engine models
+
+@dataclass
+class EngineStats:
+    cycles_total: int = 0
+    no_entry: int = 0
+
+    trades_total: int = 0
+    tp: int = 0
+    sl: int = 0
+    time: int = 0
+
+    gross_pnl_usd: float = 0.0
+    fees_usd: float = 0.0
+    net_pnl_usd: float = 0.0
+
+    # split net PnL by outcome (TP/SL/TIME)
+    net_tp_usd: float = 0.0
+    net_sl_usd: float = 0.0
+    net_time_usd: float = 0.0
+
+
+@dataclass
+class ScenarioTotals:
+    trades: int = 0
+    tp: int = 0
+    sl: int = 0
+    time: int = 0
+
+    gross_pnl_usd: float = 0.0
+    fees_usd: float = 0.0
+    net_pnl_usd: float = 0.0
+
+    net_tp_usd: float = 0.0
+    net_sl_usd: float = 0.0
+    net_time_usd: float = 0.0
+
+
+@dataclass
+class ScenarioCondition:
+    label: str
+    current: Any = None
+    target: Any = None
+    ok: bool = False
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ScenarioDef:
+    key: str
+    name: str
+    direction: Direction
+    kind: Literal["PULLBACK", "BREAKOUT"]
+    conditions: list[ScenarioCondition] = field(default_factory=list)
+    refs: dict[str, Any] = field(default_factory=dict)
+
+    # compat fields for older frontend/log viewers
+    scenario_type: Optional[str] = None
+    if_then: str = ""
+
+    def __post_init__(self) -> None:
+        if self.scenario_type is None:
+            self.scenario_type = str(self.kind)
+        if not self.if_then:
+            parts: list[str] = [c.label for c in self.conditions]
+            if parts:
+                self.if_then = "SE " + " E ".join(parts) + f" ENTÃO {self.direction}."
+            else:
+                self.if_then = f"ENTÃO {self.direction}."
 # -------------------------
 
 
