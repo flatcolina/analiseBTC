@@ -18,6 +18,9 @@ class AnalysisSnapshot:
     price: float
 
     vwap: Optional[float] = None
+    ema9: Optional[float] = None
+    ema21: Optional[float] = None
+    ema55: Optional[float] = None
     ema200: Optional[float] = None
     rsi14: Optional[float] = None
     atr14: Optional[float] = None
@@ -52,6 +55,55 @@ class Candle:
     macd: Optional[float] = None
     macd_signal: Optional[float] = None
     macd_hist: Optional[float] = None
+
+
+@dataclass
+class TradeState:
+    """Estado de uma operação ativa, serializável via `asdict()`.
+
+    Campos cobrem o que `main.py` e `trade_intelligence.py` utilizam.
+    """
+
+    cycle_id: int
+    scenario_key: str
+    scenario_kind: str
+    direction: Direction
+
+    entry_time_ms: int
+    entry_raw: float
+    entry_exec: float
+    qty_btc: float
+
+    tp_price: float
+    sl_price: float
+    atr_at_entry: float
+
+    last_price: float
+
+    # Gestão
+    last_manage_ms: int = 0
+    be_moved: bool = False
+    tp_extended: bool = False
+
+    # Diagnósticos
+    best_fav_price: float = 0.0
+    worst_adv_price: float = 0.0
+    mfe_gross_usd: float = 0.0
+    mae_gross_usd: float = 0.0
+
+    # Distâncias/closest
+    closest_tp_price: float = 0.0
+    closest_tp_dist: float = 0.0
+    closest_tp_ts_ms: int = 0
+
+    closest_sl_price: float = 0.0
+    closest_sl_dist: float = 0.0
+    closest_sl_ts_ms: int = 0
+
+    # Indicadores coletados durante o trade
+    entry_indicators: Dict[str, Any] = field(default_factory=dict)
+    indicator_samples: List[Dict[str, Any]] = field(default_factory=list)
+
 
 @dataclass
 class SetupAnalysis:
