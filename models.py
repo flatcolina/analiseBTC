@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any, Literal
 
+Direction = Literal["LONG", "SHORT"]
+
 @dataclass
 class Candle:
     """Representa um candle de preço com indicadores técnicos."""
