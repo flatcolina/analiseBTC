@@ -16,7 +16,7 @@ class Candle:
     taker_buy_base_asset_volume: float
     taker_buy_quote_asset_volume: float
     ignore: float
-    # Indicadores Técnicos
+    # Indicadores Técnicos (Adicionados para os 5 Algoritmos)
     vwap: Optional[float] = None
     ema9: Optional[float] = None
     ema21: Optional[float] = None
