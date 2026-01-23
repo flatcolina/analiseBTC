@@ -232,62 +232,62 @@ class ScenarioEngine:
         self.cycle_id: int = 0
         self.cfg: dict[str, Any] = {}
 
-            self.retention_ms: int = int(os.getenv("LOG_RETENTION_HOURS", "12")) * 3600_000
+        self.retention_ms: int = int(os.getenv("LOG_RETENTION_HOURS", "12")) * 3600_000
 
-        def _prune_logs(self) -> None:
-            if not self.logs:
-                return
-            cutoff = now_ms() - self.retention_ms
-            # prune from front
-            i = 0
-            while i < len(self.logs) and int(self.logs[i].get("ts_ms", 0)) < cutoff:
-                i += 1
-            if i > 0:
-                self.logs = self.logs[i:]
+    def _prune_logs(self) -> None:
+        if not self.logs:
+            return
+        cutoff = now_ms() - self.retention_ms
+        # prune from front
+        i = 0
+        while i < len(self.logs) and int(self.logs[i].get("ts_ms", 0)) < cutoff:
+            i += 1
+        if i > 0:
+            self.logs = self.logs[i:]
 
-            # extra safety cap
-            cap = int(os.getenv("LOG_MAX_ROWS", "60000"))
-            if len(self.logs) > cap:
-                self.logs = self.logs[-cap:]
+        # extra safety cap
+        cap = int(os.getenv("LOG_MAX_ROWS", "60000"))
+        if len(self.logs) > cap:
+            self.logs = self.logs[-cap:]
 
-        def log(self, event: str, **data: Any) -> None:
-            ts = now_ms()
-            row = {"ts_ms": ts, "ts": ms_to_iso(ts), "event": event, **data}
-            self.logs.append(row)
-            self._prune_logs()
+    def log(self, event: str, **data: Any) -> None:
+        ts = now_ms()
+        row = {"ts_ms": ts, "ts": ms_to_iso(ts), "event": event, **data}
+        self.logs.append(row)
+        self._prune_logs()
 
-        async def _snapshot(self, symbol: str, interval: str, limit: int) -> tuple[list[Candle], AnalysisSnapshot]:
-            raw = await fetch_klines(symbol, interval, limit)
-            candles = parse_klines(raw)
-            if not candles:
-                raise RuntimeError("No candles returned")
+    async def _snapshot(self, symbol: str, interval: str, limit: int) -> tuple[list[Candle], AnalysisSnapshot]:
+        raw = await fetch_klines(symbol, interval, limit)
+        candles = parse_klines(raw)
+        if not candles:
+            raise RuntimeError("No candles returned")
 
-            # Compute all indicators for the full list of candles
-            candles = compute_indicators(candles)
+        # Compute all indicators for the full list of candles
+        candles = compute_indicators(candles)
 
-            price = candles[-1].close
+        price = candles[-1].close
 
-            # The original snapshot only needs a few indicators for the old scenarios
-            avg_vol = avg_volume(candles, 20)
-            lookback = 20
-            recent = candles[-lookback:] if len(candles) >= lookback else candles
-            rh = max(c.high for c in recent) if recent else None
-            rl = min(c.low for c in recent) if recent else None
+        # The original snapshot only needs a few indicators for the old scenarios
+        avg_vol = avg_volume(candles, 20)
+        lookback = 20
+        recent = candles[-lookback:] if len(candles) >= lookback else candles
+        rh = max(c.high for c in recent) if recent else None
+        rl = min(c.low for c in recent) if recent else None
 
-            snap = AnalysisSnapshot(
-                ts_ms=now_ms(),
-                symbol=symbol,
-                interval=interval,
-                price=float(price),
-                vwap=float(candles[-1].vwap) if candles[-1].vwap is not None else None,
-                ema200=float(candles[-1].ema200) if candles[-1].ema200 is not None else None,
-                rsi14=float(candles[-1].rsi) if candles[-1].rsi is not None else None,
-                atr14=float(candles[-1].atr) if candles[-1].atr is not None else None,
-                avg_vol20=avg_vol,
-                recent_high=rh,
-                recent_low=rl,
-            )
-            return candles, snap
+        snap = AnalysisSnapshot(
+            ts_ms=now_ms(),
+            symbol=symbol,
+            interval=interval,
+            price=float(price),
+            vwap=float(candles[-1].vwap) if candles[-1].vwap is not None else None,
+            ema200=float(candles[-1].ema200) if candles[-1].ema200 is not None else None,
+            rsi14=float(candles[-1].rsi) if candles[-1].rsi is not None else None,
+            atr14=float(candles[-1].atr) if candles[-1].atr is not None else None,
+            avg_vol20=avg_vol,
+            recent_high=rh,
+            recent_low=rl,
+        )
+        return candles, snap
 
     def _build_scenarios(
         self,
