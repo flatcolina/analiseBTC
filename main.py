@@ -20,7 +20,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Any, Literal, Optional
 
 import httpx
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 # Importar modelos de dados compartilhados
@@ -1535,6 +1535,27 @@ def api_logs(
     rows = [r for r in engine.logs if int(r.get("ts_ms", 0)) >= cutoff]
     return {"logs": rows[-int(limit_i):], "hours": hours_f, "returned": min(len(rows), int(limit_i))}
 
+
+# ---------------------------------------------------------------------------
+# Configuração (apenas em memória)
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/config")
+def api_get_config():
+    """Retorna os parâmetros atuais dos algoritmos.
+
+    Importante: NÃO é persistido (reinício do serviço reseta para default).
+    """
+    return {"persisted": False, "config": analyzer.get_config()}
+
+
+@app.post("/api/config")
+def api_set_config(payload: dict = Body(...)):
+    """Atualiza parâmetros dos algoritmos (em memória)."""
+    new_cfg = analyzer.set_config(payload)
+    return {"ok": True, "persisted": False, "config": new_cfg}
+
 @app.get("/api/full_analysis", response_model=FullAnalysis)
 async def get_full_analysis(
     symbol: str = Query("BTCUSDT"),
@@ -1579,3 +1600,29 @@ async def api_conditions(
 
 ### REMOVIDO: havia um segundo endpoint duplicado com o mesmo path "/api/full_analysis"
 ### que referenciava um nome não importado (scalping_analyzer) e podia gerar conflitos.
+
+
+# -----------------------------
+# Servir o frontend (Railway/1 serviço)
+# -----------------------------
+# Se existir um build do frontend em ./static, o backend serve a SPA no mesmo domínio.
+# Assim, o frontend pode chamar /api/* sem CORS e sem precisar configurar BASE URL.
+
+from pathlib import Path
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+
+
+_STATIC_DIR = Path(__file__).parent / "static"
+_INDEX_HTML = _STATIC_DIR / "index.html"
+
+if _STATIC_DIR.exists() and _INDEX_HTML.exists():
+    # Rotas /api/* já estão registradas acima; este mount fica por último.
+    app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="frontend")
+
+    @app.get("/{full_path:path}")
+    async def spa_fallback(full_path: str):
+        # Não interferir com API
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not Found")
+        return FileResponse(str(_INDEX_HTML))
