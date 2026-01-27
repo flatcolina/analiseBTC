@@ -25,6 +25,14 @@ class AnalysisSnapshot:
     rsi14: Optional[float] = None
     atr14: Optional[float] = None
 
+    volume: Optional[float] = None
+    vol_ratio20: Optional[float] = None
+
+    macd: Optional[float] = None
+    macd_signal: Optional[float] = None
+    macd_hist: Optional[float] = None
+
+
     avg_vol20: Optional[float] = None
     recent_high: Optional[float] = None
     recent_low: Optional[float] = None
@@ -64,6 +72,8 @@ class TradeState:
     Campos cobrem o que `main.py` e `trade_intelligence.py` utilizam.
     """
 
+    # Identificador único do trade (não confundir com scenario_key, que indica o tipo do cenário)
+    trade_id: str
     cycle_id: int
     scenario_key: str
     scenario_kind: str

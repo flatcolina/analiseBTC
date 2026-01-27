@@ -286,21 +286,41 @@ class ScenarioEngine:
         self.lock = asyncio.Lock()
 
         self.logs: list[dict[str, Any]] = []
+        # Histórico detalhado de trades finalizados (com samples a cada N segundos)
+        self.trade_journal: list[dict[str, Any]] = []
+
         self.stats = EngineStats()
 
         # breakdown
-        self.by_kind: dict[str, ScenarioTotals] = {"PULLBACK": ScenarioTotals(), "BREAKOUT": ScenarioTotals()}
+        self.by_kind: dict[str, ScenarioTotals] = {"PULLBACK": ScenarioTotals(), "BREAKOUT": ScenarioTotals(), "MANUAL": ScenarioTotals()}
         self.by_key: dict[str, ScenarioTotals] = {}
 
         self.last_snapshot: AnalysisSnapshot | None = None
         self.last_scenarios: list[ScenarioDef] = []
         self.last_cycle: dict[str, Any] | None = None
-        self.active_trade: TradeState | None = None
+        # Trades ativos em paralelo (key = trade_id)
+        self.active_trades: dict[str, TradeState] = {}
+        # Tasks de monitoramento por trade (para limpeza/controle)
+        self.active_trade_tasks: dict[str, asyncio.Task] = {}
 
         self.cycle_id: int = 0
         self.cfg: dict[str, Any] = {}
 
         self.retention_ms: int = int(os.getenv("LOG_RETENTION_HOURS", "12")) * 3600_000
+
+    def _max_active_trades(self) -> int:
+        """Limite de trades ativos simultâneos (para evitar explosão de requests/memória)."""
+        try:
+            return max(1, int(os.getenv("MAX_ACTIVE_TRADES", "5")))
+        except Exception:
+            return 5
+
+    def _active_trade_compat(self) -> TradeState | None:
+        """Compat: alguns endpoints/UX antigos esperam um único `active_trade`."""
+        if not self.active_trades:
+            return None
+        # ordem determinística: pelo horário de entrada
+        return sorted(self.active_trades.values(), key=lambda t: t.entry_time_ms)[0]
 
     def _prune_logs(self) -> None:
         if not self.logs:
@@ -348,9 +368,17 @@ class ScenarioEngine:
             interval=interval,
             price=float(price),
             vwap=float(candles[-1].vwap) if candles[-1].vwap is not None else None,
+            ema9=float(candles[-1].ema9) if getattr(candles[-1], "ema9", None) is not None else None,
+            ema21=float(candles[-1].ema21) if getattr(candles[-1], "ema21", None) is not None else None,
+            ema55=float(candles[-1].ema55) if getattr(candles[-1], "ema55", None) is not None else None,
             ema200=float(candles[-1].ema200) if candles[-1].ema200 is not None else None,
             rsi14=float(candles[-1].rsi) if candles[-1].rsi is not None else None,
             atr14=float(candles[-1].atr) if candles[-1].atr is not None else None,
+            volume=float(candles[-1].volume) if getattr(candles[-1], "volume", None) is not None else None,
+            vol_ratio20=(float(candles[-1].volume) / float(avg_vol)) if (getattr(candles[-1], "volume", None) is not None and avg_vol not in (None, 0)) else None,
+            macd=float(candles[-1].macd) if getattr(candles[-1], "macd", None) is not None else None,
+            macd_signal=float(candles[-1].macd_signal) if getattr(candles[-1], "macd_signal", None) is not None else None,
+            macd_hist=float(candles[-1].macd_hist) if getattr(candles[-1], "macd_hist", None) is not None else None,
             avg_vol20=avg_vol,
             recent_high=rh,
             recent_low=rl,
@@ -615,25 +643,36 @@ class ScenarioEngine:
                     trade.closest_sl_price = price
                     trade.closest_sl_ts_ms = ts_ms
 
-            # store indicator state (compact)
-            trade.indicator_samples.append({
-                "ts_ms": ts_ms,
-                "ts": ms_to_iso(ts_ms),
-                "price": price,
-                "vwap": snap.vwap,
-                "ema200": snap.ema200,
-                "rsi14": snap.rsi14,
-                "atr14": snap.atr14,
-                "avg_vol20": snap.avg_vol20,
-                "recent_high": snap.recent_high,
-                "recent_low": snap.recent_low,
-                "tp": tp,
-                "sl": sl,
-            })
+            # store indicator state (a cada N segundos — permite encontrar padrões futuramente)
+            sample_every_ms = int(os.getenv("TRADE_SAMPLE_SECONDS", "30")) * 1000
+            last_ts = int(trade.indicator_samples[-1].get("ts_ms", 0)) if trade.indicator_samples else 0
+            if (not trade.indicator_samples) or (ts_ms - last_ts >= sample_every_ms):
+                trade.indicator_samples.append({
+                    "ts_ms": ts_ms,
+                    "ts": ms_to_iso(ts_ms),
+                    "price": price,
+                    "vwap": snap.vwap,
+                    "ema9": snap.ema9,
+                    "ema21": snap.ema21,
+                    "ema55": snap.ema55,
+                    "ema200": snap.ema200,
+                    "rsi14": snap.rsi14,
+                    "atr14": snap.atr14,
+                    "volume": snap.volume,
+                    "vol_ratio20": snap.vol_ratio20,
+                    "macd": snap.macd,
+                    "macd_signal": snap.macd_signal,
+                    "macd_hist": snap.macd_hist,
+                    "avg_vol20": snap.avg_vol20,
+                    "recent_high": snap.recent_high,
+                    "recent_low": snap.recent_low,
+                    "tp": tp,
+                    "sl": sl,
+                })
 
-            # avoid unbounded memory if something runs for very long
-            if len(trade.indicator_samples) > 2000:
-                trade.indicator_samples = trade.indicator_samples[-2000:]
+                # avoid unbounded memory if something runs for very long
+                if len(trade.indicator_samples) > 4000:
+                    trade.indicator_samples = trade.indicator_samples[-4000:]
         except Exception:
             return
 
@@ -868,9 +907,13 @@ class ScenarioEngine:
         tp_extend_add_atr: float,
         recalc_seconds: float,
     ) -> dict[str, Any]:
-        self.active_trade = trade
+        # registra trade ativo (permite múltiplos em paralelo)
+        async with self.lock:
+            self.active_trades[trade.trade_id] = trade
+
         self.log(
             "TRADE_SET",
+            trade_id=trade.trade_id,
             cycle_id=trade.cycle_id,
             scenario_key=trade.scenario_key,
             scenario_kind=trade.scenario_kind,
@@ -883,43 +926,49 @@ class ScenarioEngine:
             atr_at_entry=trade.atr_at_entry,
         )
 
-        deadline = now_ms() + max_hold_minutes * 60_000
-        while self.running and now_ms() < deadline:
-            cur_price = await fetch_price(symbol)
-            trade.last_price = cur_price
+        try:
+            deadline = now_ms() + max_hold_minutes * 60_000
+            while self.running and now_ms() < deadline:
+                cur_price = await fetch_price(symbol)
+                trade.last_price = cur_price
 
-            # run trade management periodically
-            try:
-                await self._manage_trade(
-                    trade=trade,
-                    symbol=symbol,
-                    interval=interval,
-                    limit=limit,
-                    poll_seconds=poll_seconds,
-                    fee_rate_per_side=fee_rate_per_side,
-                    slippage_bps=slippage_bps,
-                    be_trigger_r=be_trigger_r,
-                    trail_atr_mult=trail_atr_mult,
-                    tp_extend_buffer_atr=tp_extend_buffer_atr,
-                    tp_extend_add_atr=tp_extend_add_atr,
-                    recalc_seconds=recalc_seconds,
-                )
-            except Exception as e:
-                self.log("MANAGE_ERROR", cycle_id=trade.cycle_id, error=str(e))
+                # run trade management periodically
+                try:
+                    await self._manage_trade(
+                        trade=trade,
+                        symbol=symbol,
+                        interval=interval,
+                        limit=limit,
+                        poll_seconds=poll_seconds,
+                        fee_rate_per_side=fee_rate_per_side,
+                        slippage_bps=slippage_bps,
+                        be_trigger_r=be_trigger_r,
+                        trail_atr_mult=trail_atr_mult,
+                        tp_extend_buffer_atr=tp_extend_buffer_atr,
+                        tp_extend_add_atr=tp_extend_add_atr,
+                        recalc_seconds=recalc_seconds,
+                    )
+                except Exception as e:
+                    self.log("MANAGE_ERROR", trade_id=trade.trade_id, cycle_id=trade.cycle_id, error=str(e))
 
-            hit_tp = (cur_price >= trade.tp_price) if trade.direction == "LONG" else (cur_price <= trade.tp_price)
-            hit_sl = (cur_price <= trade.sl_price) if trade.direction == "LONG" else (cur_price >= trade.sl_price)
+                hit_tp = (cur_price >= trade.tp_price) if trade.direction == "LONG" else (cur_price <= trade.tp_price)
+                hit_sl = (cur_price <= trade.sl_price) if trade.direction == "LONG" else (cur_price >= trade.sl_price)
 
-            if hit_tp or hit_sl:
-                outcome = "TP" if hit_tp else "SL"
-                exit_raw = trade.tp_price if hit_tp else trade.sl_price
-                return self._finalize_trade(trade, outcome, exit_raw, fee_rate_per_side, slippage_bps)
+                if hit_tp or hit_sl:
+                    outcome = "TP" if hit_tp else "SL"
+                    exit_raw = trade.tp_price if hit_tp else trade.sl_price
+                    return self._finalize_trade(trade, outcome, exit_raw, fee_rate_per_side, slippage_bps)
 
-            await asyncio.sleep(poll_seconds)
+                await asyncio.sleep(poll_seconds)
 
-        # TIMEOUT or stopped => close at last price
-        exit_raw = trade.last_price if trade.last_price > 0 else await fetch_price(symbol)
-        return self._finalize_trade(trade, "TIME", exit_raw, fee_rate_per_side, slippage_bps)
+            # TIMEOUT or stopped => close at last price
+            exit_raw = trade.last_price if trade.last_price > 0 else await fetch_price(symbol)
+            return self._finalize_trade(trade, "TIME", exit_raw, fee_rate_per_side, slippage_bps)
+        finally:
+            # remove do mapa de ativos + task registry
+            async with self.lock:
+                self.active_trades.pop(trade.trade_id, None)
+                self.active_trade_tasks.pop(trade.trade_id, None)
 
     def _finalize_trade(
         self,
@@ -1028,9 +1077,23 @@ class ScenarioEngine:
             'entry_indicators': trade.entry_indicators,
             'indicator_samples': trade.indicator_samples,
         }
+        # Também guarda em um "journal" separado para análise futura (com samples)
+        # trade_id é único; scenario_key é apenas o tipo do cenário (ex.: PULLBACK_LONG)
+        info["trade_id"] = trade.trade_id
+
+        self.trade_journal.append(info)
+
+        # retenção/limite para não estourar memória
+        retention_hours = int(os.getenv("TRADE_RETENTION_HOURS", os.getenv("LOG_RETENTION_HOURS", "72")))
+        max_trades = int(os.getenv("TRADE_JOURNAL_MAX", "200"))
+        if retention_hours > 0:
+            cutoff_ms = now_ms() - retention_hours * 3600_000
+            self.trade_journal = [t for t in self.trade_journal if int(t.get("exit_time_ms", 0) or 0) >= cutoff_ms]
+        if max_trades > 0 and len(self.trade_journal) > max_trades:
+            self.trade_journal = self.trade_journal[-max_trades:]
+
 
         self.log("TRADE_END", cycle_id=trade.cycle_id, **info)
-        self.active_trade = None
         return info
 
     async def _run(
@@ -1149,6 +1212,18 @@ class ScenarioEngine:
                 continue
 
             # enter
+            # Se já atingimos o limite de trades simultâneos, não abrimos novos trades neste ciclo.
+            if len(self.active_trades) >= self._max_active_trades():
+                self.stats.no_entry += 1
+                self.last_cycle = {
+                    "cycle_id": cid,
+                    "status": "SKIP_MAX_ACTIVE_TRADES",
+                    "active_trades": len(self.active_trades),
+                }
+                self.log("CYCLE_SKIP_MAX_ACTIVE_TRADES", cycle_id=cid, active_trades=len(self.active_trades))
+                await asyncio.sleep(poll_seconds)
+                continue
+
             direction: Direction = triggered.direction
             atr_val = float(snap.atr14 or 0.0)
             raw_price = float(snap.price)
@@ -1164,7 +1239,9 @@ class ScenarioEngine:
 
             entry_time = now_ms()
 
+            trade_id = f"{triggered.key}_{cid}_{entry_time}"
             trade = TradeState(
+                trade_id=trade_id,
                 cycle_id=cid,
                 scenario_key=triggered.key,
                 scenario_kind=triggered.kind,
@@ -1192,9 +1269,17 @@ class ScenarioEngine:
                 'ts': ms_to_iso(snap.ts_ms),
                 'price': raw_price,
                 'vwap': snap.vwap,
+                'ema9': snap.ema9,
+                'ema21': snap.ema21,
+                'ema55': snap.ema55,
                 'ema200': snap.ema200,
                 'rsi14': snap.rsi14,
                 'atr14': snap.atr14,
+                'volume': snap.volume,
+                'vol_ratio20': snap.vol_ratio20,
+                'macd': snap.macd,
+                'macd_signal': snap.macd_signal,
+                'macd_hist': snap.macd_hist,
                 'avg_vol20': snap.avg_vol20,
                 'recent_high': snap.recent_high,
                 'recent_low': snap.recent_low,
@@ -1203,6 +1288,7 @@ class ScenarioEngine:
 
             self.log(
                 "ENTER",
+                trade_id=trade.trade_id,
                 cycle_id=cid,
                 scenario_key=trade.scenario_key,
                 scenario_kind=trade.scenario_kind,
@@ -1217,38 +1303,204 @@ class ScenarioEngine:
                 sl_price=sl_price,
             )
 
-            exit_info = await self._monitor_trade(
-                trade=trade,
-                symbol=symbol,
-                interval=interval,
-                limit=limit,
-                poll_seconds=poll_seconds,
-                fee_rate_per_side=fee_rate_per_side,
-                slippage_bps=slippage_bps,
-                max_hold_minutes=max_hold_minutes,
-                be_trigger_r=be_trigger_r,
-                trail_atr_mult=trail_atr_mult,
-                tp_extend_buffer_atr=tp_extend_buffer_atr,
-                tp_extend_add_atr=tp_extend_add_atr,
-                recalc_seconds=recalc_seconds,
+            # Monitoramento roda em paralelo para permitir múltiplos trades simultâneos.
+            task = asyncio.create_task(
+                self._monitor_trade(
+                    trade=trade,
+                    symbol=symbol,
+                    interval=interval,
+                    limit=limit,
+                    poll_seconds=poll_seconds,
+                    fee_rate_per_side=fee_rate_per_side,
+                    slippage_bps=slippage_bps,
+                    max_hold_minutes=max_hold_minutes,
+                    be_trigger_r=be_trigger_r,
+                    trail_atr_mult=trail_atr_mult,
+                    tp_extend_buffer_atr=tp_extend_buffer_atr,
+                    tp_extend_add_atr=tp_extend_add_atr,
+                    recalc_seconds=recalc_seconds,
+                )
             )
+            async with self.lock:
+                self.active_trade_tasks[trade.trade_id] = task
 
-            dur = (exit_info["exit_time_ms"] - entry_time) / 1000.0
             self.last_cycle = {
                 "cycle_id": cid,
-                "status": f"ENTERED_{exit_info['outcome']}",
+                "status": "ENTERED_ACTIVE",
+                "trade_id": trade.trade_id,
                 "scenario_key": triggered.key,
                 "scenario_kind": triggered.kind,
-                "duration_seconds": dur,
                 "entry_time": ms_to_iso(entry_time),
-                "exit_time": exit_info["exit_time"],
-                "net_pnl_usd": exit_info["net_pnl_usd"],
             }
             self.log("CYCLE_END", cycle_id=cid, summary=self.last_cycle)
 
             await asyncio.sleep(0.25)
 
         self.log("STOPPED")
+
+    
+    async def manual_enter(
+        self,
+        direction: str,
+        symbol: str = "BTCUSDT",
+        interval: str = "1m",
+        limit: int = 500,
+        collateral_usd: float = 1000.0,
+        entry_price: float | None = None,
+    ) -> dict[str, Any]:
+        """Inicia uma operação **simulada** manualmente.
+
+        Requisitos:
+        - O motor precisa estar rodando (status.running=true), pois o monitoramento (TP/SL/tempo) depende disso.
+        - Respeita o limite de trades paralelos (MAX_ACTIVE_TRADES).
+        """
+        async with self.lock:
+            if not self.running:
+                return {"error": "Inicie a simulação (robô) antes de entrar manualmente."}
+            if len(self.active_trades) >= self._max_active_trades():
+                return {"error": f"Limite de trades ativos atingido ({len(self.active_trades)}/{self._max_active_trades()})."}
+            # reserva um cycle_id para esta entrada manual (fica no histórico/estatísticas)
+            self.cycle_id += 1
+            cid = self.cycle_id
+
+        # usa as configs atuais do motor (se existirem) para slippage/tp/sl etc
+        cfg = dict(self.cfg or {})
+        # fallback seguro
+        slippage_bps = float(cfg.get("slippage_bps", 2.0))
+        fee_rate_per_side = float(cfg.get("fee_rate_per_side", 0.001))
+        poll_seconds = float(cfg.get("poll_seconds", 5.0))
+        max_hold_minutes = int(cfg.get("max_hold_minutes", 25))
+        be_trigger_r = float(cfg.get("be_trigger_r", 0.8))
+        trail_atr_mult = float(cfg.get("trail_atr_mult", 0.8))
+        tp_extend_buffer_atr = float(cfg.get("tp_extend_buffer_atr", 0.15))
+        tp_extend_add_atr = float(cfg.get("tp_extend_add_atr", 0.50))
+        recalc_seconds = float(cfg.get("recalc_seconds", 30.0))
+        tp_atr_mult = float(cfg.get("tp_atr_mult", 1.0))
+        sl_atr_mult = float(cfg.get("sl_atr_mult", 0.7))
+
+        # garante que o monitoramento use o mesmo símbolo/intervalo/limit (ou os defaults do motor)
+        symbol = symbol or cfg.get("symbol", "BTCUSDT")
+        interval = interval or cfg.get("interval", "1m")
+        limit = int(limit or cfg.get("limit", 500))
+
+        # snapshot + indicadores
+        candles, snap = await self._snapshot(symbol, interval, limit)
+
+        dir_up = str(direction or "").upper()
+        if dir_up not in ("LONG", "SHORT"):
+            return {"error": "direction deve ser LONG (COMPRA) ou SHORT (VENDA)"}
+
+        raw_price = float(entry_price) if entry_price is not None else float(snap.price or 0.0)
+        if raw_price <= 0:
+            return {"error": "Preço inválido para entrada manual."}
+
+        entry_side: Literal["BUY", "SELL"] = "BUY" if dir_up == "LONG" else "SELL"
+        entry_exec = apply_slippage(raw_price, entry_side, slippage_bps)
+        qty = collateral_usd / entry_exec if entry_exec > 0 else 0.0
+
+        atr_val = float(snap.atr14 or 0.0)
+        tp_dist = atr_val * tp_atr_mult
+        sl_dist = atr_val * sl_atr_mult
+        tp_price = raw_price + tp_dist if dir_up == "LONG" else raw_price - tp_dist
+        sl_price = raw_price - sl_dist if dir_up == "LONG" else raw_price + sl_dist
+
+        entry_time = now_ms()
+
+        trade_id = f"MANUAL_{dir_up}_{cid}_{entry_time}"
+
+        trade = TradeState(
+            trade_id=trade_id,
+            cycle_id=cid,
+            scenario_key=f"MANUAL_{dir_up}",
+            scenario_kind="MANUAL",
+            direction=dir_up,
+            entry_time_ms=entry_time,
+            entry_raw=raw_price,
+            entry_exec=entry_exec,
+            qty_btc=qty,
+            tp_price=tp_price,
+            sl_price=sl_price,
+            atr_at_entry=atr_val,
+        )
+
+        # salva indicadores da entrada + primeira amostra
+        trade.entry_indicators = asdict(snap)
+        self._update_trade_diagnostics(trade, snap)
+
+        self.log(
+            "MANUAL_ENTER",
+            cycle_id=cid,
+            direction=dir_up,
+            symbol=symbol,
+            interval=interval,
+            entry_raw=raw_price,
+            tp_price=tp_price,
+            sl_price=sl_price,
+        )
+        # inicializa diagnósticos/âncoras e salva indicadores da ENTRADA (para análise futura)
+        trade.closest_tp_price = raw_price
+        trade.closest_tp_dist = abs(raw_price - trade.tp_price) if trade.tp_price else 0.0
+        trade.closest_tp_ts_ms = snap.ts_ms
+
+        trade.closest_sl_price = raw_price
+        trade.closest_sl_dist = abs(raw_price - trade.sl_price) if trade.sl_price else 0.0
+        trade.closest_sl_ts_ms = snap.ts_ms
+
+        trade.entry_indicators = {
+            'ts_ms': snap.ts_ms,
+            'ts': ms_to_iso(snap.ts_ms),
+            'price': raw_price,
+            'vwap': snap.vwap,
+            'ema9': snap.ema9,
+            'ema21': snap.ema21,
+            'ema55': snap.ema55,
+            'ema200': snap.ema200,
+            'rsi14': snap.rsi14,
+            'atr14': snap.atr14,
+            'volume': snap.volume,
+            'vol_ratio20': snap.vol_ratio20,
+            'macd': snap.macd,
+            'macd_signal': snap.macd_signal,
+            'macd_hist': snap.macd_hist,
+            'avg_vol20': snap.avg_vol20,
+            'recent_high': snap.recent_high,
+            'recent_low': snap.recent_low,
+        }
+        trade.indicator_samples = [dict(trade.entry_indicators, tp=trade.tp_price, sl=trade.sl_price)]
+
+
+        # roda o monitoramento em background para não travar a API
+        async def _bg():
+            try:
+                info = await self._monitor_trade(
+                    trade=trade,
+                    symbol=symbol,
+                    interval=interval,
+                    limit=limit,
+                    poll_seconds=poll_seconds,
+                    fee_rate_per_side=fee_rate_per_side,
+                    slippage_bps=slippage_bps,
+                    max_hold_minutes=max_hold_minutes,
+                    be_trigger_r=be_trigger_r,
+                    trail_atr_mult=trail_atr_mult,
+                    tp_extend_buffer_atr=tp_extend_buffer_atr,
+                    tp_extend_add_atr=tp_extend_add_atr,
+                    recalc_seconds=recalc_seconds,
+                )
+                # atualiza last_cycle para o painel
+                self.last_cycle = {
+                    "cycle_id": cid,
+                    "status": f"MANUAL_{info.get('outcome', 'DONE')}",
+                    "direction": dir_up,
+                    "scenario_key": trade.scenario_key,
+                    "scenario_kind": trade.scenario_kind,
+                }
+            except Exception as e:
+                self.log("MANUAL_ENTER_ERROR", cycle_id=cid, error=str(e))
+
+        asyncio.create_task(_bg())
+
+        return {"ok": True, "cycle_id": cid, "trade": asdict(trade)}
 
     async def start(self, **cfg: Any) -> None:
         async with self.lock:
@@ -1267,7 +1519,15 @@ class ScenarioEngine:
                 await asyncio.wait_for(t, timeout=2.0)
             except Exception:
                 pass
-        self.active_trade = None
+
+        # aguarda um curto período para os trades ativos finalizarem (o loop deles observa self.running)
+        tasks = list(self.active_trade_tasks.values())
+        if tasks:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=3.0)
+            except Exception:
+                pass
+
         self.log("STOP_REQUESTED")
 
     def reset(self) -> None:
@@ -1275,12 +1535,13 @@ class ScenarioEngine:
         self.task = None
         self.logs = []
         self.stats = EngineStats()
-        self.by_kind = {"PULLBACK": ScenarioTotals(), "BREAKOUT": ScenarioTotals()}
+        self.by_kind = {"PULLBACK": ScenarioTotals(), "BREAKOUT": ScenarioTotals(), "MANUAL": ScenarioTotals()}
         self.by_key = {}
         self.last_snapshot = None
         self.last_scenarios = []
         self.last_cycle = None
-        self.active_trade = None
+        self.active_trades = {}
+        self.active_trade_tasks = {}
         self.cycle_id = 0
         self.cfg = {}
         self.log("RESET_DONE")
@@ -1361,6 +1622,33 @@ async def api_start(
         recalc_seconds=recalc_seconds,
     )
     return {"ok": True, "running": engine.running, "cfg": engine.cfg}
+
+
+@app.post("/api/manual_enter")
+async def api_manual_enter(
+    direction: str = Query(..., description="LONG=COMPRA, SHORT=VENDA"),
+    symbol: str = Query("BTCUSDT"),
+    interval: str = Query("1m"),
+    collateral_usd: float = Query(10000.0, gt=0),
+    limit: int = Query(500, ge=50, le=1000),
+    entry_price: float | None = Query(None),
+):
+    """Entrada manual (simulada).
+
+    Use quando você quiser 'clicar para entrar' e deixar o sistema monitorar TP/SL/tempo,
+    registrando indicadores + logs para análise posterior.
+    """
+    res = await engine.manual_enter(
+        direction=direction,
+        symbol=symbol,
+        interval=interval,
+        limit=limit,
+        collateral_usd=collateral_usd,
+        entry_price=entry_price,
+    )
+    if "error" in res:
+        raise HTTPException(status_code=400, detail=res["error"])
+    return res
 
 @app.post("/api/stop")
 async def api_stop():
@@ -1501,6 +1789,9 @@ def api_diagnostics(
 
 @app.get("/api/status")
 def api_status():
+    active_list = list(engine.active_trades.values())
+    active_list.sort(key=lambda t: getattr(t, "entry_time_ms", 0))
+    compat = engine._active_trade_compat()
     return {
         "running": engine.running,
         "stats": asdict(engine.stats),
@@ -1509,7 +1800,11 @@ def api_status():
         "last_snapshot": asdict(engine.last_snapshot) if engine.last_snapshot else None,
         "last_scenarios": [asdict(s) for s in engine.last_scenarios],
         "last_cycle": engine.last_cycle,
-        "active_trade": asdict(engine.active_trade) if engine.active_trade else None,
+        # Backward compat: mantém o campo active_trade apontando para o primeiro trade ativo (se existir)
+        "active_trade": asdict(compat) if compat else None,
+        # Novo: lista completa de trades ativos (paralelos)
+        "active_trades": [asdict(t) for t in active_list],
+        "active_trades_count": len(active_list),
         "logs_len": len(engine.logs),
         "cfg": engine.cfg,
     }
@@ -1534,6 +1829,64 @@ def api_logs(
     cutoff = now_ms() - int(hours_f * 3600_000)
     rows = [r for r in engine.logs if int(r.get("ts_ms", 0)) >= cutoff]
     return {"logs": rows[-int(limit_i):], "hours": hours_f, "returned": min(len(rows), int(limit_i))}
+
+# ---------------------------------------------------------------------------
+# Trades (journal detalhado para análise futura)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/trades")
+def api_trades(
+    hours: str = Query("72"),
+    limit: str = Query("200"),
+    include_samples: bool = Query(False),
+):
+    """Retorna histórico de trades finalizados.
+
+    - `include_samples=false` retorna apenas resumo (mais leve).
+    - `include_samples=true` inclui `indicator_samples` (pode ser grande).
+    """
+    hours_f = _parse_float(hours, 72.0)
+    if hours_f < 0.1:
+        hours_f = 0.1
+    if hours_f > 720.0:
+        hours_f = 720.0
+
+    limit_i = _parse_int(limit, 200)
+    if limit_i < 1:
+        limit_i = 1
+    if limit_i > 2000:
+        limit_i = 2000
+
+    cutoff = now_ms() - int(hours_f * 3600_000)
+    rows = [t for t in engine.trade_journal if int(t.get("exit_time_ms", 0) or 0) >= cutoff]
+    rows = rows[-int(limit_i):]
+
+    if include_samples:
+        return {"trades": rows, "hours": hours_f, "returned": len(rows)}
+
+    # resumo (sem samples)
+    out = []
+    for t in rows:
+        tt = dict(t)
+        samples = tt.pop("indicator_samples", None)
+        tt["samples_count"] = len(samples or [])
+        # entry_indicators pode ficar (é pequeno)
+        out.append(tt)
+    return {"trades": out, "hours": hours_f, "returned": len(out)}
+
+
+@app.get("/api/trades/{trade_id}")
+def api_trade_by_id(trade_id: str, include_samples: bool = Query(True)):
+    """Detalhe de um trade específico pelo `trade_id`."""
+    for t in engine.trade_journal:
+        if str(t.get("trade_id")) == trade_id:
+            if include_samples:
+                return t
+            tt = dict(t)
+            tt.pop("indicator_samples", None)
+            return tt
+    raise HTTPException(status_code=404, detail=f"Trade not found: {trade_id}")
+
 
 
 # ---------------------------------------------------------------------------
