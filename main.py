@@ -20,7 +20,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Any, Literal, Optional
 
 import httpx
-from fastapi import FastAPI, Query, Body, HTTPException
+from fastapi import FastAPI, Query, Body, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
 # Importar modelos de dados compartilhados
@@ -29,6 +29,12 @@ from models import Candle, AnalysisSnapshot, Direction, FullAnalysis, TradeState
 from scalping_analyzer import analyzer
 from indicators import ema_series, rsi_series, atr_wilder_series, avg_volume, vwap_rolling, macd_series
 from trade_intelligence import TradeIntelligence
+
+# Backtest (B3) - caminho C
+from b3_backtest import read_csv_rows, to_30s_bars, run_backtest
+
+# Backtest B3 (caminho C)
+from b3_backtest import read_csv_rows, to_30s_bars, run_backtest
 
 
 
@@ -1562,6 +1568,9 @@ app.add_middleware(
 
 engine = ScenarioEngine()
 
+# Guarda o último backtest executado (offline) para exibir no frontend
+LAST_BACKTEST: Optional[dict] = None
+
 @app.get("/health")
 def health():
     return {"ok": True, "ts": ms_to_iso(now_ms()), "binance_base": BINANCE_BASE}
@@ -1573,6 +1582,95 @@ def api_version():
         "ts": ms_to_iso(now_ms()),
         "binance_base": BINANCE_BASE,
     }
+
+
+# -------------------------
+# Backtest B3 (caminho C) - CSV -> 30s -> trades simulados
+# -------------------------
+
+
+@app.post("/api/backtest/b3_30s")
+async def api_backtest_b3_30s(
+    file: UploadFile = File(...),
+    symbol: str = Form("WINFUT"),
+    capital: float = Form(10000.0),
+    contracts: int = Form(1),
+    point_value_brl: float = Form(0.2),
+    tick_size_points: float = Form(5.0),
+    slippage_ticks: int = Form(0),
+    brokerage_brl_per_contract_per_side: float = Form(0.0),
+    exchange_fee_brl_per_contract_per_side: float = Form(0.0),
+    iss_pct_on_brokerage: float = Form(0.0),
+    score_min: int = Form(70),
+    max_parallel: int = Form(5),
+):
+    """Executa um backtest offline (arquivo CSV enviado pelo usuário).
+
+    Retorna um resumo + trades fechados + logs.
+    """
+    global LAST_BACKTEST
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Arquivo vazio")
+
+    rows = read_csv_rows(raw)
+    candles = to_30s_bars(rows)
+    if not candles:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Não consegui interpretar o CSV. "
+                "Use colunas timestamp + price (tick) OU timestamp + open/high/low/close (candle)."
+            ),
+        )
+
+    # roda backtest usando os mesmos algoritmos do sistema
+    res = run_backtest(
+        candles,
+        analyzer.get_full_analysis,
+        symbol=symbol,
+        capital=float(capital),
+        score_min=int(score_min),
+        allow_parallel=True,
+        max_parallel=int(max_parallel),
+        contracts=int(contracts),
+        point_value_brl=float(point_value_brl),
+        tick_size_points=float(tick_size_points),
+        slippage_ticks=int(slippage_ticks),
+        brokerage_brl_per_contract_per_side=float(brokerage_brl_per_contract_per_side),
+        exchange_fee_brl_per_contract_per_side=float(exchange_fee_brl_per_contract_per_side),
+        iss_pct_on_brokerage=float(iss_pct_on_brokerage),
+    )
+
+    LAST_BACKTEST = res
+    return res
+
+
+@app.get("/api/backtest/last")
+def api_backtest_last():
+    global LAST_BACKTEST
+    if not LAST_BACKTEST:
+        return {"ok": False, "message": "Nenhum backtest executado ainda."}
+    return {"ok": True, "backtest": LAST_BACKTEST}
+
+
+@app.get("/api/backtest/trades")
+def api_backtest_trades(limit: int = Query(200, ge=1, le=5000)):
+    global LAST_BACKTEST
+    if not LAST_BACKTEST or "closed_trades" not in LAST_BACKTEST:
+        return {"ok": False, "trades": []}
+    trades = LAST_BACKTEST.get("closed_trades") or []
+    return {"ok": True, "trades": trades[: int(limit)]}
+
+
+@app.get("/api/backtest/logs")
+def api_backtest_logs(limit: int = Query(2000, ge=1, le=20000)):
+    global LAST_BACKTEST
+    if not LAST_BACKTEST or "logs" not in LAST_BACKTEST:
+        return {"ok": False, "logs": []}
+    logs = LAST_BACKTEST.get("logs") or []
+    return {"ok": True, "logs": logs[: int(limit)]}
 
 
 @app.post("/api/start")
